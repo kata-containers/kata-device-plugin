@@ -1,0 +1,113 @@
+// Kubernetes kubelet device plugin API v1beta1.
+// Source: k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto
+syntax = "proto3";
+
+package v1beta1;
+
+option go_package = "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1";
+
+// Registration is advertised by the kubelet; plugins call Register once.
+service Registration {
+    rpc Register(RegisterRequest) returns (Empty) {}
+}
+
+// DevicePlugin is implemented by the plugin and called by the kubelet.
+service DevicePlugin {
+    rpc GetDevicePluginOptions(Empty) returns (DevicePluginOptions) {}
+    rpc ListAndWatch(Empty) returns (stream ListAndWatchResponse) {}
+    rpc GetPreferredAllocation(PreferredAllocationRequest) returns (PreferredAllocationResponse) {}
+    rpc Allocate(AllocateRequest) returns (AllocateResponse) {}
+    rpc PreStartContainer(PreStartContainerRequest) returns (PreStartContainerResponse) {}
+}
+
+message Empty {}
+
+message RegisterRequest {
+    string version = 1;
+    string endpoint = 2;
+    string resource_name = 3;
+    DevicePluginOptions options = 4;
+}
+
+message DevicePluginOptions {
+    bool pre_start_required = 1;
+    bool get_preferred_allocation_available = 2;
+}
+
+message Device {
+    string ID = 1;
+    string health = 2;
+    Topology topology = 3;
+}
+
+message Topology {
+    repeated NUMANode nodes = 1;
+}
+
+message NUMANode {
+    int64 ID = 1;
+}
+
+message ListAndWatchResponse {
+    repeated Device devices = 1;
+}
+
+message PreferredAllocationRequest {
+    repeated ContainerPreferredAllocationRequest container_requests = 1;
+}
+
+message ContainerPreferredAllocationRequest {
+    repeated string available_device_i_ds = 1;
+    repeated string must_include_device_i_ds = 2;
+    int32 allocation_size = 3;
+}
+
+message PreferredAllocationResponse {
+    repeated ContainerPreferredAllocationResponse container_responses = 1;
+}
+
+message ContainerPreferredAllocationResponse {
+    repeated string device_i_ds = 1;
+}
+
+message AllocateRequest {
+    repeated ContainerAllocateRequest container_requests = 1;
+}
+
+message ContainerAllocateRequest {
+    repeated string devices_i_ds = 1;
+}
+
+message AllocateResponse {
+    repeated ContainerAllocateResponse container_responses = 1;
+}
+
+message ContainerAllocateResponse {
+    map<string, string> envs = 1;
+    repeated Mount mounts = 2;
+    repeated DeviceSpec devices = 3;
+    map<string, string> annotations = 4;
+    repeated CDIDevice cdi_devices = 5;
+}
+
+message Mount {
+    string host_path = 1;
+    string container_path = 2;
+    bool read_only = 3;
+}
+
+message DeviceSpec {
+    string host_path = 1;
+    string container_path = 2;
+    string permissions = 3;
+}
+
+message CDIDevice {
+    string name = 1;
+}
+
+message PreStartContainerRequest {
+    repeated string devices_i_ds = 1;
+}
+
+message PreStartContainerResponse {}

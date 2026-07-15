@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kata-device-plugin-config
+  namespace: kube-system
+data:
+  config.toml: |
+    [gpu]
+    # Kubernetes extended resource name for passthrough GPUs.
+    # Must match what workload pods request.  Clashes with another plugin
+    # advertising the same name are intentional — they signal misconfiguration.
+    resource_name = "nvidia.com/gpu"
+
+    # Directory containing VFIO group device files (numeric entries only).
+    # Binding happens on the trusted side; this plugin only reads the directory.
+    device_dir = "/dev/vfio"
+
+    [nvswitch]
+    # Set to true on NVL72/GB300/Vera-Rubin nodes that expose NVSwitch devices.
+    enabled = false
+    resource_name = "nvidia.com/nvswitch"
+    device_dir = "/dev/vfio"
+
+    [plugin]
+    # Kubelet device plugin socket directory.  Rarely needs changing.
+    socket_dir = "/var/lib/kubelet/device-plugins"
+
+    # Directory where the host-side CDI spec is written.  The Kata shim reads
+    # this at SandboxCreate to resolve nvidia.com/gpu=<N> → /dev/vfio/devices/vfioN.
+    cdi_dir = "/var/run/cdi"

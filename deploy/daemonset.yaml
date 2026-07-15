@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kata-device-plugin
+  namespace: kube-system
+  labels:
+    app: kata-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app: kata-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: kata-device-plugin
+    spec:
+      serviceAccountName: kata-device-plugin
+      priorityClassName: system-node-critical
+
+      # Only run on nodes where GFD has confirmed GPU presence.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      # The plugin must start before workload pods on the node.
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: kata-device-plugin
+          image: kata-device-plugin:latest
+          imagePullPolicy: IfNotPresent
+
+          env:
+            # NODE_NAME is injected via the downward API — not a config option.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          # No privileged flag, no added capabilities — ADR 10000.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # cdi_dir write requires writable fs
+            runAsNonRoot: false             # kubelet socket ownership may require uid 0
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: [ALL]
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kata-device-plugin
+              readOnly: true
+            - name: kubelet-socket
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: vfio
+              mountPath: /dev/vfio
+              readOnly: true
+            - name: cdi
+              mountPath: /var/run/cdi
+            - name: dmi
+              mountPath: /sys/class/dmi/id
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      volumes:
+        - name: config
+          configMap:
+            name: kata-device-plugin-config
+        - name: kubelet-socket
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
+            type: DirectoryOrCreate
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: dmi
+          hostPath:
+            path: /sys/class/dmi/id
+            type: Directory

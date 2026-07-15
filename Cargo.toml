@@ -1,0 +1,39 @@
+[package]
+name = "kata-device-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kata_device_plugin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kata-device-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+kube = { version = "0.97", features = ["runtime", "client"] }
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+container-device-interface = "1.1.1"
+notify = "6"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["sync"] }
+toml = "0.8"
+tonic = "0.12"
+tower = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[build-dependencies]
+tonic-build = "0.12"
