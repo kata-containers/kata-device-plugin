@@ -44,7 +44,7 @@ DRA earns its place when there are real topology constraints — heterogeneous f
 
 ### Why there is no tray-level or aggregate resource
 
-Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consumption policy, and that decision belongs to the layer above. The scheduler is free to consume the declared devices as a whole (`nvidia.com/gpu: 4` on a GB200 compute tray is the whole tray) or as a subset (`: 2`); the plugin does not pre-empt that choice by bundling devices into units. Whole-node intent is a count plus node labels and taints, expressed in pod specs and placement policy.
+Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consumption policy, and that decision belongs to the layer above. The scheduler is free to consume the declared devices as a whole (`nvidia.com/gpu: 4` on a GB200 compute tray is the whole tray) or as a subset (`nvidia.com/gpu: 2`); the plugin does not pre-empt that choice by bundling devices into units. Whole-node intent is a count plus node labels and taints, expressed in pod specs and placement policy.
 
 The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
 
