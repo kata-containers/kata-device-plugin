@@ -22,8 +22,8 @@ other code changes.
 
 For each present resource the plugin:
 
-1. writes a host CDI spec (`/var/run/cdi/kata.<resource>.yaml`) mapping
-   device indices to IOMMUFD cdev paths,
+1. writes a host CDI spec mapping device indices to IOMMUFD cdev paths —
+   `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,
 3. answers `Allocate` with CDI device names (`nvidia.com/gpu=0`) — the
@@ -59,8 +59,9 @@ make deploy  # kubectl apply -f deploy/daemonset.yaml
 
 The DaemonSet mounts three host paths: the kubelet device-plugin socket
 directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
-with every capability dropped — root is required only because the kubelet
-owns its socket directory.
+(pinned with `runAsUser: 0`) with every capability dropped and a read-only
+root filesystem — root is required only because the kubelet owns its
+socket directory.
 
 ## See also
 

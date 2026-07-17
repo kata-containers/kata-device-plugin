@@ -38,7 +38,8 @@ spec:
             # All writes go to hostPath mounts (CDI specs, kubelet socket),
             # which readOnlyRootFilesystem does not affect.
             readOnlyRootFilesystem: true
-            runAsNonRoot: false             # kubelet socket ownership requires uid 0
+            runAsUser: 0                    # kubelet socket ownership requires uid 0
+            runAsNonRoot: false
             seccompProfile:
               type: RuntimeDefault
             capabilities:
