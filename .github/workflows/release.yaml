@@ -49,11 +49,17 @@ jobs:
 
       - name: Derive tag
         id: version
+        # cargo metadata rather than grepping the TOML: immune to formatting,
+        # trailing comments, and workspace layout.  Validate the result
+        # against the Docker tag charset here — a SemVer like 0.3.0+build1
+        # is legal in Cargo.toml but would only fail at the manifest step,
+        # after per-arch images are already pushed.
         run: |
           set -euo pipefail
-          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          if [[ -z "$ver" ]]; then
-            echo "Failed to extract version from Cargo.toml" >&2
+          ver=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kata-device-plugin") | .version')
+          if [[ ! "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Version '${ver}' from Cargo.toml is not a Docker-tag-safe semver." >&2
             exit 1
           fi
           echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
