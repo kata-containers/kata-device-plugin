@@ -64,11 +64,18 @@ pub fn write_cdi_spec(
     let out_yaml = serde_yaml::to_string(&spec).context("serialize CDI spec")?;
     // Write-then-rename: the ListAndWatch poller and Allocate may both write
     // this spec, and the Kata shim may read it at any moment — a reader must
-    // never see a torn file.
-    let tmp_path = out_path.with_extension("yaml.tmp");
+    // never see a torn file.  The tmp name is unique per write (pid +
+    // counter) so concurrent writers can't rename each other's bytes or trip
+    // over a shared tmp path.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = out_path.with_extension(format!("yaml.{}.{seq}.tmp", std::process::id()));
     std::fs::write(&tmp_path, out_yaml).with_context(|| format!("write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &out_path)
-        .with_context(|| format!("rename to {}", out_path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+        // Best effort: don't litter the registry with tmp files on retries.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("rename to {}", out_path.display()));
+    }
 
     info!(
         path = %out_path.display(),
