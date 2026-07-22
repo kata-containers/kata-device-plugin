@@ -299,6 +299,67 @@ async fn devices_appearing_after_startup_are_published() {
     node.shutdown().await;
 }
 
+/// Remove cdev `vfio<n>` and its fake sysfs entry — the inverse of `add_dev`.
+fn remove_dev(root: &std::path::Path, n: u32) {
+    std::fs::remove_file(root.join("devices").join(format!("vfio{n}"))).unwrap();
+    std::fs::remove_dir_all(root.join("sysfs").join(format!("vfio{n}"))).unwrap();
+}
+
+#[tokio::test]
+async fn same_count_device_swap_refreshes_cdi_spec() {
+    // vfio0 is replaced by vfio5 between polls.  The advertised Device list
+    // is identical (one device, id "0"), but the CDI index → cdev mapping
+    // changed, so the poller must detect the swap, rewrite the spec, and
+    // push an update.
+    let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+
+    let (mut stream, first) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(first.devices.len(), 1);
+    assert!(node
+        .spec("kata.nvidia.com-gpu.yaml")
+        .unwrap()
+        .contains("vfio0"));
+
+    remove_dev(node._vfio.path(), 0);
+    add_dev(node._vfio.path(), 5, "0x10de", "0x030200");
+
+    let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("timed out waiting for swap update")
+        .unwrap()
+        .expect("stream closed");
+    assert_eq!(updated.devices.len(), 1, "count unchanged by design");
+    let spec = node.spec("kata.nvidia.com-gpu.yaml").unwrap();
+    assert!(spec.contains("vfio5"), "spec must point at the new cdev");
+    assert!(!spec.contains("vfio0"), "spec must not keep the dead cdev");
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn last_device_disappearing_removes_cdi_spec() {
+    let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+
+    let (mut stream, first) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(first.devices.len(), 1);
+    assert!(node.spec("kata.nvidia.com-gpu.yaml").is_some());
+
+    remove_dev(node._vfio.path(), 0);
+
+    let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("timed out waiting for removal update")
+        .unwrap()
+        .expect("stream closed");
+    assert_eq!(updated.devices.len(), 0);
+    assert!(
+        node.spec("kata.nvidia.com-gpu.yaml").is_none(),
+        "stale CDI spec must be removed when the last device vanishes"
+    );
+
+    node.shutdown().await;
+}
+
 #[tokio::test]
 async fn gpu_and_nvswitch_filtered_by_pci_class() {
     // A mixed node: 2 GPUs, 3 NVSwitches, and a VFIO-bound NIC that matches

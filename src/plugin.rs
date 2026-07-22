@@ -107,7 +107,8 @@ impl DeviceServer {
 
         // Remove the CDI spec on clean shutdown so no stale device paths
         // remain on disk if the node is reconfigured while the plugin is absent.
-        // On crash the file stays, but startup always overwrites it with a fresh scan.
+        // On crash the file stays, but the ListAndWatch poller replaces it from
+        // a fresh scan on the kubelet's first call after restart.
         let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
         match tokio::fs::remove_file(&cdi_file).await {
             Ok(()) => info!(path = %cdi_file.display(), "removed CDI spec on shutdown"),
@@ -171,39 +172,52 @@ impl DevicePlugin for DeviceServer {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let server = self.clone();
         tokio::spawn(async move {
-            let mut last: Option<Vec<Device>> = None;
+            let mut last: Option<Vec<u32>> = None;
             loop {
+                // Exit when the kubelet drops the stream, even if the device
+                // set never changes again — otherwise this task would poll
+                // forever across kubelet reconnects.
+                if tx.is_closed() {
+                    break;
+                }
+
                 let vfio_devs =
                     vfio::enumerate(&server.device_dir, &server.sysfs_dir, &server.resource);
-                let current: Vec<Device> = vfio_devs
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, _)| Device {
-                        id: idx.to_string(),
-                        health: "Healthy".to_owned(),
-                        topology: None,
-                    })
-                    .collect();
+                // Compare the backing cdev numbers, not the advertised Device
+                // list: IDs are just indices 0..n, so a same-count swap
+                // (vfio7 gone, vfio9 new) would look identical to the kubelet
+                // while the CDI spec's index → cdev mapping went stale.
+                let nums: Vec<u32> = vfio_devs.iter().map(|d| d.num).collect();
 
-                if Some(&current) != last.as_ref() {
+                if Some(&nums) != last.as_ref() {
                     info!(
-                        count = current.len(),
+                        count = nums.len(),
                         resource = server.resource.name,
                         "device list changed"
                     );
-                    if !vfio_devs.is_empty() {
-                        if let Err(e) =
-                            cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
-                        {
-                            tracing::warn!("CDI spec write failed: {e:#}");
+                    if vfio_devs.is_empty() {
+                        // The last device vanished: remove the spec so it
+                        // can't resolve to device nodes that no longer exist.
+                        let cdi_file = cdi::spec_path(&server.cdi_dir, server.resource.name);
+                        if let Err(e) = std::fs::remove_file(&cdi_file) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(%e, path = %cdi_file.display(), "stale CDI spec removal failed");
+                            }
                         }
-                    }
-                    last = Some(current.clone());
-                    if tx
-                        .send(Ok(ListAndWatchResponse { devices: current }))
-                        .await
-                        .is_err()
+                    } else if let Err(e) =
+                        cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
                     {
+                        tracing::warn!("CDI spec write failed: {e:#}");
+                    }
+                    let devices = (0..nums.len())
+                        .map(|idx| Device {
+                            id: idx.to_string(),
+                            health: "Healthy".to_owned(),
+                            topology: None,
+                        })
+                        .collect();
+                    last = Some(nums);
+                    if tx.send(Ok(ListAndWatchResponse { devices })).await.is_err() {
                         break;
                     }
                 }
