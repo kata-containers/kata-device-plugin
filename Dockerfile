@@ -10,12 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock* ./
+# No glob on Cargo.lock: it is committed, and --locked below is meaningless
+# if a missing lockfile silently passes the COPY.
+COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY proto/ proto/
 COPY src/ src/
 
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # ── runtime stage ──────────────────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12

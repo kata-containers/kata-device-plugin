@@ -1,23 +1,99 @@
 name: Release image
 
-# Builds the container natively on each architecture (no QEMU) and stitches
-# one multi-arch manifest: GB200 nodes pull arm64, HGX nodes pull amd64.
+# Dispatch-only, NVRC-style: the version is deduced from Cargo.toml — the
+# single source of truth — and the matching git tag is pushed only after the
+# image manifest is published.  No tag-push trigger, so a hand-pushed tag can
+# never release a mismatched version.  Builds natively on each architecture
+# (no QEMU) and stitches one multi-arch manifest: GB200 nodes pull arm64, HGX
+# nodes pull amd64.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
-permissions:
-  contents: read
-  packages: write
+# One release at a time, no queue-jumping cancellation: a second dispatch
+# waits instead of racing the first on the latest tag or failing at tag
+# creation because both derived the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  preflight:
+    name: Derive version from Cargo.toml
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # checkout on private repos; authed tag-existence check
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Refuse to release from a non-default branch
+        # Expansions go through env, never into the script text (zizmor:
+        # template-injection); ref_name is dispatch-chosen input.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ "${REF_NAME}" != "${DEFAULT_BRANCH}" ]]; then
+            echo "Releases are cut from ${DEFAULT_BRANCH} only, not ${REF_NAME}." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Derive tag
+        id: version
+        # cargo metadata rather than grepping the TOML: immune to formatting,
+        # trailing comments, and workspace layout.  --locked so metadata can
+        # never rewrite Cargo.lock.  Validate the result against the Docker
+        # tag charset here — a SemVer like 0.3.0+build1 is legal in
+        # Cargo.toml but would only fail at the manifest step, after
+        # per-arch images are already pushed.
+        run: |
+          set -euo pipefail
+          ver=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kata-device-plugin") | .version')
+          if [[ ! "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Version '${ver}' from Cargo.toml is not a Docker-tag-safe semver." >&2
+            exit 1
+          fi
+          echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if the tag already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        # Three-way, not boolean: only a definite 404 means the tag is free.
+        # Auth or transient API failures must stop the release here, not
+        # after the image manifest is already published.
+        run: |
+          set -euo pipefail
+          if out=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" 2>&1); then
+            echo "Tag ${TAG} already exists — bump the version in Cargo.toml first." >&2
+            exit 1
+          elif grep -q "HTTP 404" <<<"${out}"; then
+            echo "Tag ${TAG} is free."
+          else
+            echo "Tag existence check failed: ${out}" >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: preflight
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -37,16 +113,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Explicit buildx setup rather than trusting the runner's docker to
+      # alias build → buildx: deterministic across runner image changes.
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
       - name: Build and push per-arch image
+        # --push: buildx pushes as part of the build; no separate docker push.
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker build -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
-          docker push "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}"
+          docker buildx build --push -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
 
   manifest:
     name: Multi-arch manifest
-    needs: build
+    needs: [preflight, build]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -60,12 +143,35 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Stitch and tag
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           docker buildx imagetools create \
-            -t "${IMAGE}:v${VERSION}" \
+            -t "${IMAGE}:${TAG}" \
             -t "${IMAGE}:${GIT_SHA}" \
             -t "${IMAGE}:latest" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
+
+  tag:
+    name: Push the release tag
+    # Last, deliberately: if a build or the manifest fails, no tag is
+    # created, so nothing ever points at an unreleased commit and the
+    # preflight "tag exists" check can't block the retry.
+    needs: [preflight, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create the tag via the API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          REPO: ${{ github.repository }}
+        # The API rather than git push: no checkout, no persisted git
+        # credentials (zizmor).
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/git/refs" \
+            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
