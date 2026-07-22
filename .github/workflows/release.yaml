@@ -1,23 +1,70 @@
 name: Release image
 
-# Builds the container natively on each architecture (no QEMU) and stitches
-# one multi-arch manifest: GB200 nodes pull arm64, HGX nodes pull amd64.
+# Dispatch-only, NVRC-style: the version is deduced from Cargo.toml — the
+# single source of truth — and preflight creates the matching git tag.  No
+# tag-push trigger, so a hand-pushed tag can never release a mismatched
+# version.  Builds natively on each architecture (no QEMU) and stitches one
+# multi-arch manifest: GB200 nodes pull arm64, HGX nodes pull amd64.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  preflight:
+    name: Derive version from Cargo.toml
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # pushes the release tag
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Derive tag
+        id: version
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [[ -z "$ver" ]]; then
+            echo "Failed to extract version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if the tag already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — bump the version in Cargo.toml first." >&2
+            exit 1
+          fi
+
+      - name: Create and push the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        # Via the API rather than git push: checkout runs with
+        # persist-credentials: false (zizmor), so git has no token.
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: preflight
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -46,7 +93,10 @@ jobs:
 
   manifest:
     name: Multi-arch manifest
-    needs: build
+    needs: [preflight, build]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -60,12 +110,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Stitch and tag
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           docker buildx imagetools create \
-            -t "${IMAGE}:v${VERSION}" \
+            -t "${IMAGE}:${TAG}" \
             -t "${IMAGE}:${GIT_SHA}" \
             -t "${IMAGE}:latest" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
