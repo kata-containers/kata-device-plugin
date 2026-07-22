@@ -9,7 +9,8 @@ use std::time::Duration;
 use kata_device_plugin::dp::v1beta1::{
     device_plugin_client::DevicePluginClient,
     registration_server::{Registration, RegistrationServer},
-    AllocateRequest, ContainerAllocateRequest, Empty, ListAndWatchResponse, RegisterRequest,
+    AllocateRequest, ContainerAllocateRequest, Empty, ListAndWatchResponse,
+    PreStartContainerRequest, PreferredAllocationRequest, RegisterRequest,
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::{Resource, RESOURCES};
@@ -381,6 +382,136 @@ async fn last_device_disappearing_removes_cdi_spec() {
         node.spec("kata.nvidia.com-gpu.yaml").is_none(),
         "stale CDI spec must be removed when the last device vanishes"
     );
+
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn poller_exits_when_kubelet_drops_the_stream() {
+    // A kubelet reconnect drops the old ListAndWatch stream.  The poller
+    // behind it must notice (tx.is_closed()) and exit on its next tick, not
+    // keep polling forever.  Exercised by dropping the stream and letting
+    // one tick elapse; a leaked poller would show up as the next test's
+    // spurious CDI writes and, in coverage, as the break never taken.
+    let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+
+    let (stream, first) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(first.devices.len(), 1);
+
+    drop(stream);
+    // One full poll interval with the receiver gone: the poller wakes,
+    // sees the closed channel, and exits.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    node.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cdi_write_failure_is_retried_next_tick() {
+    // Break the CDI spec path, change the device set: the poller must still
+    // push the update to the kubelet but keep retrying the CDI write until
+    // the path is writable again — a transient failure must not leave a
+    // permanently stale spec.  A directory squatting on the spec path makes
+    // std::fs::write fail with EISDIR, root or not (chmod tricks don't work
+    // as root, and dir write bits don't stop overwriting an existing file).
+    let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+
+    let (mut stream, first) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(first.devices.len(), 1);
+
+    let spec_path = node.cdi.path().join("kata.nvidia.com-gpu.yaml");
+    std::fs::remove_file(&spec_path).unwrap();
+    std::fs::create_dir(&spec_path).unwrap();
+    add_dev(node._vfio.path(), 1, "0x10de", "0x030200");
+
+    // The device update must reach the kubelet even while the CDI write fails.
+    let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("timed out waiting for device update")
+        .unwrap()
+        .expect("stream closed");
+    assert_eq!(updated.devices.len(), 2);
+    assert!(
+        spec_path.is_dir(),
+        "spec cannot have been written over the blocking dir"
+    );
+
+    // Path is writable again: a later tick retries and the spec catches up.
+    std::fs::remove_dir(&spec_path).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(spec) = node.spec("kata.nvidia.com-gpu.yaml") {
+            if spec.contains("vfio1") {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CDI write never retried"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn registration_failure_is_not_fatal() {
+    // No kubelet.sock at all: registration fails, but the server must come
+    // up and serve anyway — the kubelet finds plugin sockets by scanning the
+    // directory on restart, so dying here would turn a kubelet restart into
+    // a permanent outage.
+    let vfio = fake_vfio(1);
+    let sockets = TempDir::new().unwrap();
+    let cdi = TempDir::new().unwrap();
+
+    let server = DeviceServer::new(
+        resource("nvidia.com/gpu"),
+        vfio.path().to_str().unwrap(),
+        vfio.path().join("sysfs").to_str().unwrap(),
+        sockets.path().to_str().unwrap(),
+        cdi.path().to_str().unwrap(),
+    );
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(server.run(token.clone()));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut stream = unix_client(sockets.path().join("kata-gpu.sock"))
+        .await
+        .list_and_watch(Request::new(Empty {}))
+        .await
+        .expect("server must serve despite failed registration")
+        .into_inner();
+    let resp = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("ListAndWatch timeout")
+        .unwrap()
+        .expect("stream closed");
+    assert_eq!(resp.devices.len(), 1);
+
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn grpc_stubs_respond() {
+    // GetPreferredAllocation and PreStartContainer are protocol stubs; the
+    // kubelet may still call them, so they must answer instead of erroring.
+    let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+    let mut client = node.client("kata-gpu.sock").await;
+
+    client
+        .get_preferred_allocation(Request::new(PreferredAllocationRequest::default()))
+        .await
+        .expect("GetPreferredAllocation must answer");
+    client
+        .pre_start_container(Request::new(PreStartContainerRequest::default()))
+        .await
+        .expect("PreStartContainer must answer");
 
     node.shutdown().await;
 }
