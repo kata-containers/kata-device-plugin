@@ -28,12 +28,11 @@ async fn main() -> anyhow::Result<()> {
         sd.cancel();
     });
 
-    // Declared by the node, not configured: advertise exactly the RESOURCES
-    // rows that have VFIO-bound devices.
-    // Start one server per known resource unconditionally.  Each server's
-    // watcher task polls for VFIO devices and pushes updates into
-    // ListAndWatch, so late-appearing devices (VFIO binding races the DP
-    // startup) are picked up without restarting the pod.
+    // Declared by the node, not configured: one server per RESOURCES row,
+    // started unconditionally.  Each ListAndWatch stream polls for VFIO
+    // devices and pushes updates as the bound set changes (0..n), so
+    // late-appearing devices (VFIO binding races the DP startup) are picked
+    // up without restarting the pod.
     let servers: Vec<_> = vfio::RESOURCES
         .iter()
         .map(|res| {

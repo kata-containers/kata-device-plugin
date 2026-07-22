@@ -267,7 +267,7 @@ async fn empty_vfio_dir_advertises_no_devices() {
     node.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn devices_appearing_after_startup_are_published() {
     // Start with an empty dir, then add a GPU cdev — simulates VFIO binding
     // racing DP startup.  The watcher must pick up the new device and push an
@@ -283,8 +283,9 @@ async fn devices_appearing_after_startup_are_published() {
     // Simulate the VFIO cdev appearing after the DP is already running.
     add_dev(node._vfio.path(), 0, "0x10de", "0x030200");
 
-    // The watcher polls every POLL_INTERVAL (5 s in prod; the test overrides
-    // nothing, so we wait for the next natural tick).  Give it up to 10 s.
+    // The poller ticks every POLL_INTERVAL (5 s).  Time is paused
+    // (start_paused), so the tick auto-advances as soon as the runtime idles;
+    // the 10 s timeout is virtual too and only fires on a real hang.
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
         .await
         .expect("timed out waiting for updated ListAndWatch response")
@@ -305,7 +306,7 @@ fn remove_dev(root: &std::path::Path, n: u32) {
     std::fs::remove_dir_all(pcilibs_rs::testfs::sysfs(root).join(format!("vfio{n}"))).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn same_count_device_swap_refreshes_cdi_spec() {
     // vfio0 is replaced by vfio5 between polls.  The advertised Device list
     // is identical (one device, id "0"), but the CDI index → cdev mapping
@@ -336,7 +337,7 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
     node.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn last_device_disappearing_removes_cdi_spec() {
     let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
 
