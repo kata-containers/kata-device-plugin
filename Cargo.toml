@@ -18,9 +18,8 @@ hyper-util = "0.1"
 # Pinned to the PR #108 merge commit (public spec fields, optional clap,
 # jsonschema without reqwest) until the next crates.io release.
 container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "4de398c8bc49518aa792565a0c62d1b968a7b87c" }
-# Pinned to the PR #6 merge commit (IommufdDev device id + device_name)
-# until the first crates.io release.
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "ce6486db79ade33028583a9e81245db5f4de2079" }
+# No crates.io release with Sysfs yet, so pinned to current main.
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca" }
 prost = "0.14"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
@@ -33,7 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "ce6486db79ade33028583a9e81245db5f4de2079", features = ["testfs"] }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca", features = ["testfs"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 

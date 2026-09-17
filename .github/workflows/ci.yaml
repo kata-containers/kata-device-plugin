@@ -3,7 +3,8 @@ name: CI
 # Builds the container image from a PR head and pushes it to ghcr.io as
 # :pr<N> (mutable, tracks the PR) and :pr<N>-<sha> (immutable), one native
 # build per architecture — so test nodes (GB200 arm64, HGX amd64) can pull
-# the PR image directly instead of building locally.
+# the PR image directly instead of building locally.  Runs that cannot write
+# packages build without publishing (see push-image).
 on:
   workflow_call:
     inputs:
@@ -13,6 +14,13 @@ on:
       pr-number:
         required: true
         type: string
+      push-image:
+        # Callers must pass false when the run cannot write packages: a fork
+        # PR's GITHUB_TOKEN is capped at packages:read no matter what this
+        # workflow requests, so the push can only ever fail.
+        required: false
+        type: boolean
+        default: true
   # Allow manual runs against a branch (no PR required).
   workflow_dispatch:
     inputs:
@@ -26,6 +34,11 @@ on:
         required: false
         type: string
         default: "manual"
+      push-image:
+        description: "Push to ghcr.io (uncheck to only validate the build)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -54,6 +67,7 @@ jobs:
           persist-credentials: false
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ inputs.push-image }}
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -62,15 +76,23 @@ jobs:
       - name: Build and push per-arch image
         env:
           PR: ${{ inputs.pr-number }}
+          PUSH: ${{ inputs.push-image }}
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker build -t "${IMAGE}:pr${PR}-${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
-          docker push "${IMAGE}:pr${PR}-${GIT_SHA}-${{ matrix.arch }}"
+          TAG="${IMAGE}:pr${PR}-${GIT_SHA}-${{ matrix.arch }}"
+          docker build -t "${TAG}" --build-arg GIT_SHA="${GIT_SHA}" .
+          if [[ "${PUSH}" != "true" ]]; then
+            echo "Token cannot write packages, built ${TAG} without pushing."
+            exit 0
+          fi
+          docker push "${TAG}"
 
   pr-manifest:
     name: PR manifest
     needs: build-image
+    # Nothing was published, so there are no per-arch tags to stitch.
+    if: ${{ inputs.push-image }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

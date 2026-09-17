@@ -39,7 +39,7 @@ fn spawn_server(
         name,
         naming,
         vfio::VFIO_DIR,
-        vfio::SYSFS_DIR,
+        vfio::SYSFS_ROOT,
         plugin::SOCKET_DIR,
         plugin::CDI_DIR,
     );
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let mut desired: Vec<String> = vfio::discover(
             Path::new(vfio::VFIO_DIR),
-            Path::new(vfio::SYSFS_DIR),
+            &vfio::Sysfs::new(Path::new(vfio::SYSFS_ROOT)),
             naming,
         )
         .into_keys()

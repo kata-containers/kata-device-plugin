@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,7 +11,7 @@ use tower::service_fn;
 use tracing::info;
 
 use crate::cdi;
-use crate::vfio::{self, Naming};
+use crate::vfio::{self, Naming, Sysfs};
 
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -50,7 +50,7 @@ pub struct DeviceServer {
     naming: Naming,
     // Path fields rather than the constants so tests can inject temp dirs.
     device_dir: PathBuf,
-    sysfs_dir: PathBuf,
+    sysfs: Sysfs,
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
 }
@@ -60,7 +60,7 @@ impl DeviceServer {
         name: &str,
         naming: Naming,
         device_dir: &str,
-        sysfs_dir: &str,
+        sysfs_root: &str,
         socket_dir: &str,
         cdi_dir: &str,
     ) -> Self {
@@ -68,7 +68,7 @@ impl DeviceServer {
             name: name.to_owned(),
             naming,
             device_dir: PathBuf::from(device_dir),
-            sysfs_dir: PathBuf::from(sysfs_dir),
+            sysfs: Sysfs::new(Path::new(sysfs_root)),
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
         }
@@ -77,7 +77,7 @@ impl DeviceServer {
     /// This server's devices under the current scan: the discover() group
     /// matching our resolved name.
     fn my_devices(&self) -> Vec<vfio::IommufdDev> {
-        vfio::discover(&self.device_dir, &self.sysfs_dir, self.naming)
+        vfio::discover(&self.device_dir, &self.sysfs, self.naming)
             .remove(&self.name)
             .unwrap_or_default()
     }

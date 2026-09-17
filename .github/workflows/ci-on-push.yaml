@@ -71,6 +71,9 @@ jobs:
     with:
       commit-hash: ${{ github.event.pull_request.head.sha }}
       pr-number: ${{ github.event.pull_request.number }}
+      # Only same-repo PRs get a token that can write packages, so a fork PR
+      # builds the image to prove it compiles but stops short of publishing.
+      push-image: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
 
   # Gate job for branch protection - set "Check CI Result" as required status check.
   # Passes when: CI succeeded OR no code changes (docs-only PR).

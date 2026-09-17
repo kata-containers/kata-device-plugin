@@ -88,7 +88,7 @@ pub fn write_cdi_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfio::{self, testfs, Naming};
+    use crate::vfio::{self, testfs, Naming, Sysfs};
     use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
 
@@ -96,7 +96,7 @@ mod tests {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
-        vfio::discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias)
+        vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
             .remove("nvidia.com/gpu")
             .unwrap_or_default()
     }
@@ -166,7 +166,7 @@ mod tests {
         for n in [3u32, 4] {
             testfs::add_nvswitch(root.path(), n);
         }
-        let devs = vfio::discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias)
+        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
             .remove("nvidia.com/nvswitch")
             .unwrap_or_default();
 

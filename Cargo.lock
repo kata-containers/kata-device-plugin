@@ -1139,25 +1139,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17359afc20d7ab31fdb42bb844c8b3bb1dabd7dcf7e68428492da7f16966fcef"
 
 [[package]]
-name = "pci-ids"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "098762dc8ca11c831fee9544ae9f7eae8fc4666ec37e7b753f56d624c03d725e"
+name = "pcilibs-rs"
+version = "0.1.0"
+source = "git+https://github.com/kata-containers/pcilibs-rs?rev=f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca#f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca"
 dependencies = [
+ "libc",
+ "nix",
  "nom",
  "phf",
  "phf_codegen",
  "proc-macro2",
  "quote",
-]
-
-[[package]]
-name = "pcilibs-rs"
-version = "0.1.0"
-source = "git+https://github.com/kata-containers/pcilibs-rs?rev=ce6486db79ade33028583a9e81245db5f4de2079#ce6486db79ade33028583a9e81245db5f4de2079"
-dependencies = [
- "nix",
- "pci-ids",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub use pcilibs_rs::{IommufdDev, IOMMUFD_SYSFS_CLASS as SYSFS_DIR, IOMMUFD_VFIO_DIR as VFIO_DIR};
+pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
 /// How advertised resource names are derived (--resource-naming flag).
 #[derive(Clone, Copy, Debug)]
@@ -67,11 +67,11 @@ pub const RESOURCES: &[Resource] = &[
 /// advertised device IDs / CDI spec indices.
 pub fn discover(
     vfio_dir: &Path,
-    sysfs_dir: &Path,
+    sysfs: &Sysfs,
     naming: Naming,
 ) -> BTreeMap<String, Vec<IommufdDev>> {
     let mut map: BTreeMap<String, Vec<IommufdDev>> = BTreeMap::new();
-    for dev in pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs_dir) {
+    for dev in pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs) {
         let Some(row) = RESOURCES.iter().find(|r| {
             dev.vendor == r.vendor
                 && dev.class_prefix() == r.class_prefix
@@ -142,7 +142,7 @@ fn sanitize(raw: &str) -> String {
 pub(crate) mod testfs {
     use std::path::Path;
 
-    pub use pcilibs_rs::testfs::{add, sysfs};
+    pub use pcilibs_rs::testfs::add;
 
     /// An H100 SXM5 80GB: pci-ids 10de:2330, so SKU naming is exercised
     /// against the real database.
@@ -173,7 +173,7 @@ mod tests {
         // A VFIO-bound NIC must not be advertised under any resource.
         testfs::add(root.path(), 3, "0x15b3", "0x101e", "0x020000");
 
-        let map = discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![7, 42]);
         assert!(map["nvidia.com/gpu"][0].path.ends_with("devices/vfio7"));
@@ -186,7 +186,7 @@ mod tests {
         testfs::add_gpu(root.path(), 0);
         testfs::add_gpu(root.path(), 1);
 
-        let map = discover(root.path(), &testfs::sysfs(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
         assert_eq!(map.len(), 1);
         let (name, devs) = map.iter().next().unwrap();
         // Loose on the marketing suffix: the database may reword it, but the
@@ -204,7 +204,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         testfs::add(root.path(), 0, "0x10de", "0xdead", "0x030200");
 
-        let map = discover(root.path(), &testfs::sysfs(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("nvidia.com/gpu"));
     }
@@ -261,14 +261,14 @@ mod tests {
         std::fs::write(devices.join("vfio0"), b"").unwrap();
 
         for naming in [Naming::Alias, Naming::Sku] {
-            assert!(discover(root.path(), &testfs::sysfs(root.path()), naming).is_empty());
+            assert!(discover(root.path(), &Sysfs::new(root.path()), naming).is_empty());
         }
     }
 
     #[test]
     fn missing_devices_dir_is_empty() {
         let root = TempDir::new().unwrap();
-        assert!(discover(root.path(), &testfs::sysfs(root.path()), Naming::Alias).is_empty());
+        assert!(discover(root.path(), &Sysfs::new(root.path()), Naming::Alias).is_empty());
     }
 
     #[test]

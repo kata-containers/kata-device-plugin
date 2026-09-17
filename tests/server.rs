@@ -15,6 +15,7 @@ use kata_device_plugin::dp::v1beta1::{
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
 use pcilibs_rs::testfs::add as add_dev;
+use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -123,7 +124,7 @@ impl Node {
                     name,
                     naming,
                     vfio.path().to_str().unwrap(),
-                    vfio.path().join("sysfs").to_str().unwrap(),
+                    vfio.path().to_str().unwrap(),
                     sockets.path().to_str().unwrap(),
                     cdi.path().to_str().unwrap(),
                 );
@@ -337,7 +338,7 @@ async fn devices_appearing_after_startup_are_published() {
 /// Remove cdev `vfio<n>` and its fake sysfs entry — the inverse of `add_dev`.
 fn remove_dev(root: &std::path::Path, n: u32) {
     std::fs::remove_file(root.join("devices").join(format!("vfio{n}"))).unwrap();
-    std::fs::remove_dir_all(pcilibs_rs::testfs::sysfs(root).join(format!("vfio{n}"))).unwrap();
+    std::fs::remove_dir_all(Sysfs::new(root).vfio_dev(&format!("vfio{n}"))).unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -478,7 +479,7 @@ async fn registration_failure_is_not_fatal() {
         "nvidia.com/gpu",
         Naming::Alias,
         vfio.path().to_str().unwrap(),
-        vfio.path().join("sysfs").to_str().unwrap(),
+        vfio.path().to_str().unwrap(),
         sockets.path().to_str().unwrap(),
         cdi.path().to_str().unwrap(),
     );
@@ -513,7 +514,7 @@ async fn sku_mode_serves_under_the_sku_name() {
     // file, and device IDs must all follow the resolved name, not the row.
     let vfio = fake_vfio(2);
     let name =
-        kata_device_plugin::vfio::discover(vfio.path(), &vfio.path().join("sysfs"), Naming::Sku)
+        kata_device_plugin::vfio::discover(vfio.path(), &Sysfs::new(vfio.path()), Naming::Sku)
             .into_keys()
             .next()
             .expect("two H100 cdevs resolve to one SKU name");
