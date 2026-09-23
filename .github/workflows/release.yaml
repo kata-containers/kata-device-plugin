@@ -121,6 +121,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       matrix:
         include:
@@ -145,11 +148,26 @@ jobs:
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build and push per-arch image
+        id: build
         # --push: buildx pushes as part of the build; no separate docker push.
+        # Inline provenance is off because it adds "unknown/unknown" entries
+        # to the index; the attestation below records it as an OCI referrer
+        # instead.
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker buildx build --push -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
+          docker buildx build --push --provenance=false \
+            --metadata-file "${RUNNER_TEMP}/metadata.json" \
+            -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
+          echo "digest=$(jq -r '."containerimage.digest"' "${RUNNER_TEMP}/metadata.json")" >> "$GITHUB_OUTPUT"
+
+      # A consumer resolving one platform pins the per-architecture digest,
+      # not the index's, so each one is attested in its own right.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   manifest:
     name: Multi-arch manifest
@@ -157,6 +175,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign and attestation signing certificates
+      attestations: write
+      artifact-metadata: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,7 +190,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
       - name: Stitch and tag
+        id: stitch
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
@@ -183,6 +207,22 @@ jobs:
           fi
           docker buildx imagetools create "${tags[@]}" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.stitch.outputs.digest }}
+        # --recursive also signs each per-arch manifest, so a policy that
+        # checks the platform digest the node resolved still finds a
+        # signature.
+        run: cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.stitch.outputs.digest }}
+          push-to-registry: true
 
   release:
     name: Publish chart and GitHub release
@@ -196,20 +236,49 @@ jobs:
     permissions:
       contents: write # the release creates the tag
       packages: write # chart push to ghcr.io
+      id-token: write # keyless cosign and attestation signing certificates
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Package and push the chart
+      # cosign reads registry credentials from the docker config, not helm's.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Package the chart
+        run: helm package "${CHART_DIR}" -d dist
+
+      # The OCI chart's layer is this tarball byte for byte, so attesting the
+      # file also covers what `helm pull` fetches from the registry.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tgz
+
+      - name: Push the chart
+        id: chart
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: |
           set -euxo pipefail
           helm registry login ghcr.io -u "${ACTOR}" --password-stdin <<<"${GH_TOKEN}"
-          helm package "${CHART_DIR}" -d dist
-          helm push dist/*.tgz "${CHART_REPO}"
+          out=$(helm push dist/*.tgz "${CHART_REPO}" 2>&1)
+          echo "${out}"
+          digest=$(sed -n 's/^Digest: //p' <<<"${out}")
+          [[ "${digest}" == sha256:* ]]
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the chart
+        env:
+          DIGEST: ${{ steps.chart.outputs.digest }}
+        run: cosign sign --yes "${CHART_REPO#oci://}/kata-device-plugin@${DIGEST}"
 
       - name: Create the release and its tag
         env:
@@ -218,6 +287,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
           REPO: ${{ github.repository }}
+          IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
         # gh creates the tag through the API rather than git push, so no git
         # credentials are ever persisted (zizmor).
         run: |
@@ -232,6 +302,20 @@ jobs:
           \`\`\`sh
           helm install kata-device-plugin ${CHART_REPO}/kata-device-plugin \\
             --version ${VERSION} -n kube-system
+          \`\`\`
+
+          The image and the chart are signed with cosign, and the image, each
+          of its architectures and the chart tarball carry build provenance:
+
+          \`\`\`sh
+          cosign verify ${IMAGE}:${TAG} \\
+            --certificate-identity ${IDENTITY} \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify oci://${IMAGE}:${TAG} --repo ${REPO}
+          cosign verify ${CHART_REPO#oci://}/kata-device-plugin:${VERSION} \\
+            --certificate-identity ${IDENTITY} \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify kata-device-plugin-${VERSION}.tgz --repo ${REPO}
           \`\`\`
           EOF
           )
