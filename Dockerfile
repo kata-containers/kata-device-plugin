@@ -23,7 +23,7 @@ RUN cargo build --release --locked
 FROM gcr.io/distroless/cc-debian12
 
 # Links the ghcr.io package to this repository automatically.
-LABEL org.opencontainers.image.source="https://github.com/zvonkok/kata-device-plugin" \
+LABEL org.opencontainers.image.source="https://github.com/kata-containers/kata-device-plugin" \
       org.opencontainers.image.description="Kata device plugin: advertises VFIO-bound passthrough devices to the kubelet"
 
 COPY --from=builder /build/target/release/kata-device-plugin /kata-device-plugin
