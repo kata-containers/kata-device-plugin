@@ -1,11 +1,11 @@
-name: Release image
+name: Release
 
 # Dispatch-only, NVRC-style: the version is deduced from Cargo.toml — the
-# single source of truth — and the matching git tag is pushed only after the
-# image manifest is published.  No tag-push trigger, so a hand-pushed tag can
-# never release a mismatched version.  Builds natively on each architecture
-# (no QEMU) and stitches one multi-arch manifest: GB200 nodes pull arm64, HGX
-# nodes pull amd64.
+# single source of truth — and the matching git tag is created only after the
+# image manifest and the Helm chart are published.  No tag-push trigger, so a
+# hand-pushed tag can never release a mismatched version.  Builds natively on
+# each architecture (no QEMU) and stitches one multi-arch manifest: GB200
+# nodes pull arm64, HGX nodes pull amd64.
 on:
   workflow_dispatch:
 
@@ -20,6 +20,10 @@ permissions: {}
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  CHART_DIR: deploy/helm/kata-device-plugin
+  # Separate repository from the image so chart and image tags never mix,
+  # following kata-deploy's ghcr.io/kata-containers/kata-deploy-charts.
+  CHART_REPO: oci://ghcr.io/${{ github.repository }}-charts
 
 jobs:
   preflight:
@@ -28,7 +32,9 @@ jobs:
     permissions:
       contents: read # checkout on private repos; authed tag-existence check
     outputs:
+      version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Refuse to release from a non-default branch
         # Expansions go through env, never into the script text (zizmor:
@@ -66,7 +72,28 @@ jobs:
             echo "Version '${ver}' from Cargo.toml is not a Docker-tag-safe semver." >&2
             exit 1
           fi
-          echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${ver}"
+            echo "tag=v${ver}"
+            if [[ "${ver}" == *-* ]]; then
+              echo "prerelease=true"
+            else
+              echo "prerelease=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the chart matches and lints
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          chart_ver=$(yq -r '.version' "${CHART_DIR}/Chart.yaml")
+          app_ver=$(yq -r '.appVersion' "${CHART_DIR}/Chart.yaml")
+          if [[ "${chart_ver}" != "${VERSION}" || "${app_ver}" != "${VERSION}" ]]; then
+            echo "Chart.yaml has version ${chart_ver} / appVersion ${app_ver}, Cargo.toml has ${VERSION}." >&2
+            exit 1
+          fi
+          helm lint --strict "${CHART_DIR}"
 
       - name: Fail if the tag already exists
         env:
@@ -145,33 +172,69 @@ jobs:
       - name: Stitch and tag
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker buildx imagetools create \
-            -t "${IMAGE}:${TAG}" \
-            -t "${IMAGE}:${GIT_SHA}" \
-            -t "${IMAGE}:latest" \
+          tags=(-t "${IMAGE}:${TAG}" -t "${IMAGE}:${GIT_SHA}")
+          # Whoever pulls :latest must never land on a pre-release by accident.
+          if [[ "${PRERELEASE}" != "true" ]]; then
+            tags+=(-t "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
 
-  tag:
-    name: Push the release tag
-    # Last, deliberately: if a build or the manifest fails, no tag is
-    # created, so nothing ever points at an unreleased commit and the
-    # preflight "tag exists" check can't block the retry.
+  release:
+    name: Publish chart and GitHub release
+    # Last, deliberately: if a build, the manifest, or the chart push fails,
+    # no tag is created, so nothing ever points at an unreleased commit and
+    # the preflight "tag exists" check can't block the retry.  A retry just
+    # overwrites the already-pushed image and chart tags with identical
+    # content.
     needs: [preflight, manifest]
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: write # the release creates the tag
+      packages: write # chart push to ghcr.io
     steps:
-      - name: Create the tag via the API
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Package and push the chart
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euxo pipefail
+          helm registry login ghcr.io -u "${ACTOR}" --password-stdin <<<"${GH_TOKEN}"
+          helm package "${CHART_DIR}" -d dist
+          helm push dist/*.tgz "${CHART_REPO}"
+
+      - name: Create the release and its tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
           TAG: ${{ needs.preflight.outputs.tag }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
           REPO: ${{ github.repository }}
-        # The API rather than git push: no checkout, no persisted git
-        # credentials (zizmor).
+        # gh creates the tag through the API rather than git push, so no git
+        # credentials are ever persisted (zizmor).
         run: |
           set -euo pipefail
-          gh api "repos/${REPO}/git/refs" \
-            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
+          flags=()
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          notes=$(cat <<EOF
+          Image: \`${IMAGE}:${TAG}\` (linux/amd64, linux/arm64)
+
+          \`\`\`sh
+          helm install kata-device-plugin ${CHART_REPO}/kata-device-plugin \\
+            --version ${VERSION} -n kube-system
+          \`\`\`
+          EOF
+          )
+          gh release create "${TAG}" dist/*.tgz \
+            --repo "${REPO}" --target "${GITHUB_SHA}" --title "${TAG}" \
+            --notes "${notes}" --generate-notes "${flags[@]}"

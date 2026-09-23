@@ -60,9 +60,17 @@ stream lifecycle, and CDI output are all covered without hardware.
 
 ## Deploying
 
+Releases publish a multi-arch image (amd64, arm64) and the Helm chart to
+ghcr.io. Pin the release with `--version`, which is also the only way to
+get a pre-release such as `0.2.0-rc.0` since Helm skips those otherwise:
+
 ```sh
-make deploy  # helm upgrade --install kata-device-plugin deploy/helm/kata-device-plugin -n kube-system
+helm install kata-device-plugin \
+  oci://ghcr.io/kata-containers/kata-device-plugin-charts/kata-device-plugin \
+  --version 0.2.0 -n kube-system
 ```
+
+From a checkout, `make deploy` installs the local chart instead.
 
 The chart is the only deployment model.  It exposes only what varies per
 cluster (image, nodeSelector, tolerations, resources, resource naming,
@@ -74,6 +82,14 @@ directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
 root filesystem — root is required only because the kubelet owns its
 socket directory.
+
+## Releasing
+
+Bump the version in `Cargo.toml` and in both `version` and `appVersion` of
+the chart's `Chart.yaml`, merge that, and then dispatch the Release workflow
+on `main`. It builds and pushes the image, pushes the chart, and only then
+creates the tag and GitHub release, marking it as a pre-release (and leaving
+`:latest` alone) whenever the version has a `-` suffix.
 
 ## See also
 
