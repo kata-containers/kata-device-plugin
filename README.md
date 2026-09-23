@@ -35,10 +35,12 @@ For each present resource the plugin:
    container runtime resolves them against the host CDI registry, and the
    Kata shim wires the cold-plugged VM devices to the right container.
 
-No config file, no CLI arguments, no Kubernetes API access, no modes: all
-paths and names are kernel, kubelet, or CDI contracts expressed as
-constants. The advertised device set is fixed for the plugin's lifetime — a
-device-set change on the node means the pod restarts.
+No config file, no Kubernetes API access, and a single flag,
+`--resource-naming=alias|sku`, which picks between the table names and
+hardware-identity names like `nvidia.com/GH100_H100_SXM5_80GB`. Everything
+else is a kernel, kubelet, or CDI contract expressed as a constant. The
+device set is rescanned periodically, so newly bound devices show up
+without restarting the pod.
 
 ## Building and testing
 
