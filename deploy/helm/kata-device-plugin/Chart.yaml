@@ -4,10 +4,10 @@ description: >-
   Kubernetes device plugin that advertises the node's VFIO-bound passthrough
   devices (GPUs, NVSwitches) to the kubelet for Kata Containers workloads.
 type: application
-version: 0.1.0
-# The plugin release this chart deploys; single source of truth is the
-# repository's Cargo.toml.
-appVersion: "0.2.0"
+# Chart and plugin are released together, so both must match Cargo.toml and
+# the release workflow refuses to run otherwise.
+version: 0.2.0-rc.0
+appVersion: "0.2.0-rc.0"
 home: https://github.com/kata-containers/kata-device-plugin
 sources:
   - https://github.com/kata-containers/kata-device-plugin
