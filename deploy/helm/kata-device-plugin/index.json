@@ -1,0 +1,33 @@
+{
+  "chart": {
+    "appVersion": "0.2.0-rc.0",
+    "name": "kata-device-plugin",
+    "version": "0.2.0-rc.0"
+  },
+  "image": {
+    "defaultTag": "v0.2.0-rc.0",
+    "repository": "ghcr.io/kata-containers/kata-device-plugin"
+  },
+  "resourceNaming": {
+    "aliasResources": [
+      {
+        "name": "nvidia.com/gpu",
+        "pciClassPrefix": "0x0302",
+        "pciDeviceId": null,
+        "pciVendorId": "0x10de"
+      },
+      {
+        "name": "nvidia.com/nvswitch",
+        "pciClassPrefix": "0x0680",
+        "pciDeviceId": null,
+        "pciVendorId": "0x10de"
+      }
+    ],
+    "default": "alias",
+    "modes": [
+      "alias",
+      "sku"
+    ]
+  },
+  "schemaVersion": 1
+}
