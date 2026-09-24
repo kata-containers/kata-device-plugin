@@ -59,4 +59,6 @@ jobs:
 
       - name: Run actionlint
         run: |
-          "${RUNNER_TEMP}/actionlint"
+          # actionlint 1.7.12 predates GitHub's $/ self-repository syntax.
+          "${RUNNER_TEMP}/actionlint" \
+            -ignore '^(specifying action|reusable workflow call) "\$/.github/(actions/rust-toolchain|workflows/ci\.yaml)"'
