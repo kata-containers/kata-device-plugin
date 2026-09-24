@@ -848,6 +848,7 @@ dependencies = [
  "hyper-util",
  "pcilibs-rs",
  "prost",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",

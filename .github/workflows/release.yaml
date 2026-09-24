@@ -54,7 +54,15 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
+
+      - run: sudo apt-get install -y protobuf-compiler
+
+      - name: Check the generated chart contract
+        run: |
+          cargo run --locked --example generate-resource-contract
+          git diff --exit-code -- "${CHART_DIR}/index.json" "${CHART_DIR}/values.schema.json"
+          test -z "$(git ls-files --others --exclude-standard -- "${CHART_DIR}/index.json" "${CHART_DIR}/values.schema.json")"
 
       - name: Derive tag
         id: version

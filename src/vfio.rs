@@ -16,14 +16,23 @@ pub enum Naming {
 }
 
 impl Naming {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "alias" => Ok(Self::Alias),
-            "sku" => Ok(Self::Sku),
-            other => Err(format!(
-                "--resource-naming must be alias or sku, got {other:?}"
-            )),
+    pub const ALL: [Self; 2] = [Self::Alias, Self::Sku];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Alias => "alias",
+            Self::Sku => "sku",
         }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == s)
+            .ok_or_else(|| {
+                let modes = Self::ALL.map(Self::as_str).join(" or ");
+                format!("--resource-naming must be {modes}, got {s:?}")
+            })
     }
 }
 

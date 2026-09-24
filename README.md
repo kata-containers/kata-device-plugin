@@ -16,6 +16,9 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
 | `nvidia.com/nvswitch` | `0x10de`, class `0x0680xx` (bridge: other) |
 
+The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
+lists those rows for tools that need the resource names and PCI matches.
+
 A resource is advertised iff matching devices are VFIO-bound — declared by
 the node, not configured. Supporting a new device type is one table row; no
 other code changes.
@@ -101,6 +104,24 @@ The chart is the only deployment model.  It exposes only what varies per
 cluster (image, nodeSelector, tolerations, resources, resource naming,
 log filter); the security context and hostPath mounts are contracts, not
 configuration, and are fixed in the template.
+
+The chart includes `index.json` so consumers can read the resource names,
+supported naming modes, and default chart image from a pinned chart release.
+`aliasResources` lists the fixed names. In `sku` mode, the names come from the
+PCI ID database at runtime and can fall back to an alias when a device ID is
+unknown. The index therefore does not enumerate SKU names. The generated
+`values.schema.json` checks `resourceNaming` when Helm reads the chart.
+
+Both files are generated from the Rust resource table and the chart metadata.
+After changing either source, run:
+
+```sh
+cargo run --locked --example generate-resource-contract
+```
+
+The Static checks workflow runs this command on every pull request and fails
+if the committed files differ. The Release workflow checks them again before
+publishing.
 
 The DaemonSet mounts three host paths: the kubelet device-plugin socket
 directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
