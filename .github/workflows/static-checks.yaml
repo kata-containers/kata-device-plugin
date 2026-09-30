@@ -19,6 +19,33 @@ permissions:
 
 name: Static checks
 jobs:
+  resource-contract:
+    name: Generated resource contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install pinned Rust toolchain
+        uses: $/.github/actions/rust-toolchain
+
+      - name: Regenerate the chart contract
+        run: |
+          cargo run --locked --example generate-resource-contract
+          git diff --exit-code -- deploy/helm/kata-device-plugin/index.json deploy/helm/kata-device-plugin/values.schema.json
+          test -z "$(git ls-files --others --exclude-standard -- deploy/helm/kata-device-plugin/index.json deploy/helm/kata-device-plugin/values.schema.json)"
+
+      - name: Check the chart
+        run: |
+          chart=deploy/helm/kata-device-plugin
+          helm lint --strict "$chart"
+          expected=$(jq -r '.image.repository + ":" + .image.defaultTag' "$chart/index.json")
+          actual=$(helm template contract-check "$chart" | yq -r 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image')
+          test "$actual" = "$expected"
+
   # Detect if only docs changed - skip CI if so
   changes:
     name: Detect changes
@@ -57,7 +84,7 @@ jobs:
       - run: sudo apt-get install -y protobuf-compiler
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - run: cargo test --locked --all-features -- --include-ignored
 
@@ -73,7 +100,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
         with:
           components: rustfmt
 
@@ -94,7 +121,7 @@ jobs:
       - run: sudo apt-get install -y protobuf-compiler
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
         with:
           components: clippy
 
@@ -112,7 +139,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-audit --locked
       - run: cargo audit
@@ -129,7 +156,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
@@ -173,7 +200,7 @@ jobs:
       - run: sudo apt-get install -y protobuf-compiler
 
       - name: Install pinned Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-bloat --locked
       - run: cargo bloat --locked --release --all-features -n 20
