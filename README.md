@@ -105,6 +105,19 @@ cluster (image, nodeSelector, tolerations, resources, resource naming,
 log filter); the security context and hostPath mounts are contracts, not
 configuration, and are fixed in the template.
 
+The DaemonSet name includes both the release and component name, for example
+`parent-kata-device-plugin` when installed by a high-level parent chart with
+release name `parent`.
+Its pods then appear as `parent-kata-device-plugin-<suffix>`, identifying the
+component in namespace-wide pod listings. A standalone release named
+`kata-device-plugin` retains that name without repeating it. Names are limited
+to 63 characters; `fullnameOverride` can set an explicit DaemonSet name.
+
+Earlier charts named the DaemonSet after the release alone. To preserve an
+existing DaemonSet when upgrading, set `fullnameOverride` to that release name.
+Otherwise Helm replaces it with the new name, briefly interrupting device
+advertisement while the replacement pods start.
+
 The chart includes `index.json` so consumers can read the resource names,
 supported naming modes, and default chart image from a pinned chart release.
 `aliasResources` lists the fixed names. In `sku` mode, the names come from the
