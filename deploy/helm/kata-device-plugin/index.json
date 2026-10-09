@@ -1,11 +1,11 @@
 {
   "chart": {
-    "appVersion": "0.2.0-rc.0",
+    "appVersion": "0.2.0-rc.1",
     "name": "kata-device-plugin",
-    "version": "0.2.0-rc.0"
+    "version": "0.2.0-rc.1"
   },
   "image": {
-    "defaultTag": "v0.2.0-rc.0",
+    "defaultTag": "v0.2.0-rc.1",
     "repository": "ghcr.io/kata-containers/kata-device-plugin"
   },
   "resourceNaming": {
