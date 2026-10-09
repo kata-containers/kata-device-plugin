@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use container_device_interface::spec::validate_spec;
-use container_device_interface::specs::config::{
-    ContainerEdits, Device, DeviceNode, Spec, CURRENT_VERSION,
-};
+use container_device_interface::specs::config::{ContainerEdits, Device, DeviceNode, Spec};
 use tracing::info;
 
 use pcilibs_rs::IommufdDev;
@@ -35,7 +33,7 @@ pub fn write_cdi_spec(
     }
 
     let spec = Spec {
-        version: CURRENT_VERSION.to_owned(),
+        version: "0.6.0".to_owned(),
         kind: resource_name.to_owned(),
         devices: devices
             .iter()
@@ -112,6 +110,7 @@ mod tests {
         assert!(out.exists(), "CDI spec file not written");
 
         let contents = std::fs::read_to_string(&out).unwrap();
+        assert!(contents.contains("cdiVersion: 0.6.0"));
         assert!(contents.contains("kind: nvidia.com/gpu"));
         // serde_yaml quotes numeric-looking strings with single quotes.
         assert!(contents.contains("name: '0'"));
