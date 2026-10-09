@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ include "kata-device-plugin.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     app: kata-device-plugin

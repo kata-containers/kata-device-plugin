@@ -45,6 +45,16 @@ jobs:
           expected=$(jq -r '.image.repository + ":" + .image.defaultTag' "$chart/index.json")
           actual=$(helm template contract-check "$chart" | yq -r 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image')
           test "$actual" = "$expected"
+          name() {
+            helm template "$1" "$chart" "${@:2}" | yq -r 'select(.kind == "DaemonSet") | .metadata.name'
+          }
+          test "$(name parent)" = parent-kata-device-plugin
+          test "$(name kata-device-plugin)" = kata-device-plugin
+          test "$(name parent --set-string fullnameOverride=parent)" = parent
+          long_release=$(printf 'a%.0s' {1..53})
+          long_name=$(name "$long_release")
+          test "${#long_name}" -le 63
+          test "${long_name: -1}" != '-'
 
   # Detect if only docs changed - skip CI if so
   changes:

@@ -3,6 +3,9 @@
 # contracts baked into the template — overriding them produces a plugin
 # that does not work (see ARCHITECTURE.md, ADR 10000).
 
+# Set to the previous release name to retain an existing DaemonSet on upgrade.
+fullnameOverride: ""
+
 image:
   repository: ghcr.io/kata-containers/kata-device-plugin
   # Defaults to the chart's appVersion.
