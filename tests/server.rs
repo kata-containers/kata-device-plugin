@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use kata_device_plugin::dp::v1beta1::{
     device_plugin_client::DevicePluginClient,
     registration_server::{Registration, RegistrationServer},
@@ -91,6 +92,7 @@ struct Node {
     registered: Arc<Mutex<Option<RegisterRequest>>>,
     token: CancellationToken,
     servers: Vec<tokio::task::JoinHandle<()>>,
+    kubelet: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Node {
@@ -108,7 +110,7 @@ impl Node {
             socket_dir: sockets.path().to_path_buf(),
             registered: registered.clone(),
         };
-        tokio::spawn(async move {
+        let kubelet = tokio::spawn(async move {
             Server::builder()
                 .add_service(RegistrationServer::new(mock))
                 .serve_with_incoming(UnixListenerStream::new(listener))
@@ -144,7 +146,55 @@ impl Node {
             registered,
             token,
             servers,
+            kubelet: Some(kubelet),
         }
+    }
+
+    async fn stop_kubelet(&mut self, remove_plugin_socket: bool) -> anyhow::Result<()> {
+        if let Some(task) = self.kubelet.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        std::fs::remove_file(self.sockets.path().join("kubelet.sock"))?;
+        if remove_plugin_socket {
+            std::fs::remove_file(self.sockets.path().join("kata-gpu.sock"))?;
+        }
+        *self.registered.lock().map_err(|e| anyhow::anyhow!("{e}"))? = None;
+        Ok(())
+    }
+
+    fn start_kubelet(&mut self) -> anyhow::Result<()> {
+        let listener = UnixListener::bind(self.sockets.path().join("kubelet.sock"))?;
+        let mock = MockKubelet {
+            socket_dir: self.sockets.path().to_path_buf(),
+            registered: self.registered.clone(),
+        };
+        self.kubelet = Some(tokio::spawn(async move {
+            Server::builder()
+                .add_service(RegistrationServer::new(mock))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await
+                .ok();
+        }));
+        Ok(())
+    }
+
+    async fn wait_for_registration(&self) -> anyhow::Result<RegisterRequest> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let registration = self
+                    .registered
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .clone();
+                if let Some(registration) = registration {
+                    return Ok(registration);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("plugin did not register with restarted kubelet")?
     }
 
     async fn client(&self, sock: &str) -> DevicePluginClient<Channel> {
@@ -185,10 +235,100 @@ impl Node {
                 .expect("server did not shut down after cancel")
                 .unwrap();
         }
+        if let Some(task) = self.kubelet {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recovers_from_repeated_kubelet_restarts() -> anyhow::Result<()> {
+    let mut node = Node::start(fake_vfio(2), &["nvidia.com/gpu"]).await;
+    node.wait_for_registration().await?;
+    let (mut old_stream, initial) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(initial.devices.len(), 2);
+
+    for restart in 0..2 {
+        // Kubelet unlinks plugin endpoints on startup. Keep the old stream
+        // open to ensure endpoint recreation does not wait for it to drain.
+        node.stop_kubelet(true).await?;
+        add_dev(
+            node._vfio.path(),
+            restart + 2,
+            "0x10de",
+            "0x2330",
+            "0x030200",
+        );
+        if restart == 0 {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert!(node.sockets.path().join("kata-gpu.sock").exists());
+            assert!(node.spec("kata.nvidia.com-gpu.yaml").is_some());
+        }
+        node.start_kubelet()?;
+        let registration = node.wait_for_registration().await?;
+        assert_eq!(registration.resource_name, "nvidia.com/gpu");
+        assert_eq!(registration.endpoint, "kata-gpu.sock");
+        assert!(node.servers.iter().all(|task| !task.is_finished()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(Some(_)) = old_stream.message().await {}
+        })
+        .await
+        .context("old ListAndWatch stream remained open after endpoint recreation")?;
+
+        let (new_stream, snapshot) = node.snapshot("kata-gpu.sock").await;
+        assert_eq!(snapshot.devices.len(), (restart + 3) as usize);
+        let spec = node
+            .spec("kata.nvidia.com-gpu.yaml")
+            .context("missing CDI spec")?;
+        assert!(spec.contains(&format!("vfio{}", restart + 2)));
+        old_stream = new_stream;
+    }
+
+    node.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reregisters_when_only_kubelet_socket_is_replaced() -> anyhow::Result<()> {
+    let mut node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+    node.wait_for_registration().await?;
+    node.stop_kubelet(false).await?;
+    node.start_kubelet()?;
+    node.wait_for_registration().await?;
+    assert!(node.servers.iter().all(|task| !task.is_finished()));
+    let (_stream, snapshot) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(snapshot.devices.len(), 1);
+    node.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_registration_after_connection_failure() -> anyhow::Result<()> {
+    let mut node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
+    node.wait_for_registration().await?;
+    node.stop_kubelet(false).await?;
+    // An orphaned socket exists but refuses connections, unlike an absent
+    // kubelet socket. Registration must retry after the failed dial.
+    let listener = UnixListener::bind(node.sockets.path().join("kubelet.sock"))?;
+    drop(listener);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(node
+        .registered
+        .lock()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .is_none());
+    assert!(node.servers.iter().all(|task| !task.is_finished()));
+    std::fs::remove_file(node.sockets.path().join("kubelet.sock"))?;
+    node.start_kubelet()?;
+    node.wait_for_registration().await?;
+    let (_stream, snapshot) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(snapshot.devices.len(), 1);
+    node.shutdown().await;
+    Ok(())
+}
 
 #[tokio::test]
 async fn registers_with_kubelet_and_lists_devices() {
@@ -466,11 +606,9 @@ async fn cdi_write_failure_is_retried_next_tick() {
 }
 
 #[tokio::test]
-async fn registration_failure_is_not_fatal() {
-    // No kubelet.sock at all: registration fails, but the server must come
-    // up and serve anyway — the kubelet finds plugin sockets by scanning the
-    // directory on restart, so dying here would turn a kubelet restart into
-    // a permanent outage.
+async fn registration_failure_is_not_fatal() -> anyhow::Result<()> {
+    // Deployment order must not require a pod restart when kubelet becomes
+    // available after the plugin has started.
     let vfio = fake_vfio(1);
     let sockets = TempDir::new().unwrap();
     let cdi = TempDir::new().unwrap();
@@ -500,12 +638,43 @@ async fn registration_failure_is_not_fatal() {
         .expect("stream closed");
     assert_eq!(resp.devices.len(), 1);
 
+    let registered = Arc::new(Mutex::new(None));
+    let listener = UnixListener::bind(sockets.path().join("kubelet.sock"))?;
+    let mock = MockKubelet {
+        socket_dir: sockets.path().to_path_buf(),
+        registered: registered.clone(),
+    };
+    let kubelet = tokio::spawn(async move {
+        Server::builder()
+            .add_service(RegistrationServer::new(mock))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if registered
+                .lock()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .is_some()
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("plugin did not retry registration after kubelet became available")??;
+    assert!(!handle.is_finished());
+
     token.cancel();
     tokio::time::timeout(Duration::from_secs(2), handle)
         .await
         .expect("server did not shut down")
         .unwrap()
         .unwrap();
+    kubelet.abort();
+    let _ = kubelet.await;
+    Ok(())
 }
 
 #[tokio::test]

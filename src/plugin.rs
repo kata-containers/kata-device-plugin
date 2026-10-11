@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -53,6 +54,7 @@ pub struct DeviceServer {
     sysfs: Sysfs,
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
+    endpoint_shutdown: CancellationToken,
 }
 
 impl DeviceServer {
@@ -71,6 +73,7 @@ impl DeviceServer {
             sysfs: Sysfs::new(Path::new(sysfs_root)),
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
+            endpoint_shutdown: CancellationToken::new(),
         }
     }
 
@@ -83,40 +86,7 @@ impl DeviceServer {
     }
 
     pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
-        let sock_name = socket_name(&self.name);
-        let socket = self.socket_dir.join(&sock_name);
-        let _ = tokio::fs::remove_file(&socket).await;
-        let stream = UnixListenerStream::new(
-            UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?,
-        );
-
-        info!(resource = %self.name, socket = %socket.display(), "plugin server starting");
-
-        // Serve first, register after: the kubelet dials back and probes the
-        // endpoint inside the Register RPC itself, so registering before the
-        // server is live deadlocks until kubelet's 10s dial deadline expires.
-        let mut serve = tokio::spawn(
-            Server::builder()
-                .add_service(DevicePluginServer::new(self.clone()))
-                .serve_with_incoming(stream),
-        );
-
-        let kubelet = self
-            .socket_dir
-            .join("kubelet.sock")
-            .to_string_lossy()
-            .into_owned();
-        if let Err(e) = register(&kubelet, &self.name, &sock_name).await {
-            tracing::warn!("kubelet registration failed: {e:#}");
-        }
-
-        // No graceful drain on shutdown: we hold the kubelet's ListAndWatch
-        // stream open for the plugin's whole lifetime, so draining would wait
-        // forever.  Abort the server task and clean up instead.
-        tokio::select! {
-            res = &mut serve => res.context("plugin server task")?.context("plugin server")?,
-            _ = token.cancelled() => serve.abort(),
-        }
+        let result = self.serve_until_shutdown(&token).await;
 
         // Remove the CDI spec on clean shutdown so no stale device paths
         // remain on disk if the node is reconfigured while the plugin is absent.
@@ -131,7 +101,89 @@ impl DeviceServer {
             }
         }
 
-        Ok(())
+        result
+    }
+
+    async fn serve_until_shutdown(&self, token: &CancellationToken) -> anyhow::Result<()> {
+        let sock_name = socket_name(&self.name);
+        let socket = self.socket_dir.join(&sock_name);
+        let kubelet = self.socket_dir.join("kubelet.sock");
+        loop {
+            if token.is_cancelled() {
+                return Ok(());
+            }
+            match tokio::fs::remove_file(&socket).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("remove plugin socket"),
+            }
+            let listener = UnixListener::bind(&socket)
+                .with_context(|| format!("bind {}", socket.display()))?;
+            let identity = socket_identity(&socket).await?;
+            info!(resource = %self.name, socket = %socket.display(), "plugin server starting");
+
+            // Serve before registering: kubelet probes us inside Register.
+            let endpoint_shutdown = token.child_token();
+            let mut server = self.clone();
+            server.endpoint_shutdown = endpoint_shutdown.clone();
+            let mut serve = tokio::spawn(
+                Server::builder()
+                    .add_service(DevicePluginServer::new(server))
+                    .serve_with_incoming(UnixListenerStream::new(listener)),
+            );
+            let result = tokio::select! {
+                res = &mut serve => {
+                    endpoint_shutdown.cancel();
+                    return res.context("plugin server task")?.context("plugin server");
+                },
+                res = self.watch_registration(&kubelet, &socket, identity, &sock_name, token) => res,
+            };
+            // Aborting the listener alone leaves tonic's connection tasks alive.
+            endpoint_shutdown.cancel();
+            serve.abort();
+            let _ = serve.await;
+            result?;
+            if token.is_cancelled() {
+                return Ok(());
+            }
+            info!(resource = %self.name, "plugin socket removed or replaced; recreating endpoint");
+        }
+    }
+
+    async fn watch_registration(
+        &self,
+        kubelet: &Path,
+        socket: &Path,
+        identity: Option<(u64, u64, i64, i64)>,
+        endpoint: &str,
+        token: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let mut registered = None;
+        loop {
+            if socket_identity(socket).await? != identity {
+                return Ok(());
+            }
+            let current = socket_identity(kubelet).await?;
+            if current.is_none() {
+                registered = None;
+            } else if registered != current {
+                tokio::select! {
+                    _ = token.cancelled() => return Ok(()),
+                    result = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        register(kubelet, &self.name, endpoint),
+                    ) => match result {
+                        Ok(Ok(())) => registered = current,
+                        Ok(Err(e)) => tracing::warn!(resource = %self.name, "kubelet registration failed; retrying: {e:#}"),
+                        Err(e) => tracing::warn!(resource = %self.name, "kubelet registration timed out; retrying: {e}"),
+                    }
+                }
+            }
+            tokio::select! {
+                _ = token.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        }
     }
 
     /// Bring the on-disk CDI spec in line with `devs`: write it from this
@@ -157,7 +209,16 @@ impl DeviceServer {
     }
 }
 
-async fn register(kubelet_sock: &str, resource_name: &str, endpoint: &str) -> anyhow::Result<()> {
+// Include ctime so rapid unlink/rebind cycles cannot hide inode reuse.
+async fn socket_identity(path: &Path) -> anyhow::Result<Option<(u64, u64, i64, i64)>> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) => Ok(Some((m.dev(), m.ino(), m.ctime(), m.ctime_nsec()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+async fn register(kubelet_sock: &Path, resource_name: &str, endpoint: &str) -> anyhow::Result<()> {
     let sock = kubelet_sock.to_owned();
     let channel = Endpoint::try_from("http://[::]:0")?
         .connect_with_connector(service_fn(move |_: Uri| {
@@ -250,12 +311,21 @@ impl DevicePlugin for DeviceServer {
                         })
                         .collect();
                     sent = Some(nums);
-                    if tx.send(Ok(ListAndWatchResponse { devices })).await.is_err() {
-                        break;
+                    tokio::select! {
+                        _ = server.endpoint_shutdown.cancelled() => break,
+                        result = tx.send(Ok(ListAndWatchResponse { devices })) => {
+                            if result.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
 
-                tokio::time::sleep(POLL_INTERVAL).await;
+                tokio::select! {
+                    _ = server.endpoint_shutdown.cancelled() => break,
+                    _ = tx.closed() => break,
+                    _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                }
             }
         });
         Ok(Response::new(Box::pin(
