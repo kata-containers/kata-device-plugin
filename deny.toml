@@ -27,7 +27,7 @@ highlight = "all"
 
 [sources]
 unknown-registry = "warn"
-# container-device-interface is temporarily a git pin (PR #108 merge commit)
+# container-device-interface is temporarily a git pin (serde-saphyr migration)
 # until the next crates.io release.
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

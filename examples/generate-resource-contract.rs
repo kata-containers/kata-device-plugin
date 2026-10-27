@@ -1,6 +1,5 @@
 use kata_device_plugin::vfio::{Naming, RESOURCES};
-use serde_json::json;
-use serde_yaml::Value;
+use serde_json::{json, Value};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -13,8 +12,9 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, Box<dyn Error>> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let chart_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/helm/kata-device-plugin");
-    let chart: Value = serde_yaml::from_str(&fs::read_to_string(chart_dir.join("Chart.yaml"))?)?;
-    let values: Value = serde_yaml::from_str(&fs::read_to_string(chart_dir.join("values.yaml"))?)?;
+    let chart: Value = serde_saphyr::from_str(&fs::read_to_string(chart_dir.join("Chart.yaml"))?)?;
+    let values: Value =
+        serde_saphyr::from_str(&fs::read_to_string(chart_dir.join("values.yaml"))?)?;
     let version = string(&chart, "version")?;
     let app_version = string(&chart, "appVersion")?;
     if version != env!("CARGO_PKG_VERSION") || app_version != version {

@@ -59,7 +59,7 @@ pub fn write_cdi_spec(
     std::fs::create_dir_all(cdi_dir).with_context(|| format!("create {}", cdi_dir.display()))?;
 
     let out_path = spec_path(cdi_dir, resource_name);
-    let out_yaml = serde_yaml::to_string(&spec).context("serialize CDI spec")?;
+    let out_yaml = serde_saphyr::to_string(&spec).context("serialize CDI spec")?;
     // Write-then-rename: the ListAndWatch poller and Allocate may both write
     // this spec, and the Kata shim may read it at any moment — a reader must
     // never see a torn file.  The tmp name is unique per write (pid +
@@ -110,15 +110,27 @@ mod tests {
         assert!(out.exists(), "CDI spec file not written");
 
         let contents = std::fs::read_to_string(&out).unwrap();
-        assert!(contents.contains("cdiVersion: 0.6.0"));
-        assert!(contents.contains("kind: nvidia.com/gpu"));
-        // serde_yaml quotes numeric-looking strings with single quotes.
-        assert!(contents.contains("name: '0'"));
-        assert!(contents.contains("name: '1'"));
-        assert!(contents.contains("vfio8"));
-        assert!(contents.contains("vfio9"));
-        // Only the passthrough cdevs are edited in — nothing else.
-        assert!(!contents.contains("/dev/iommu"));
+        let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
+        let yaml: serde_json::Value = serde_saphyr::from_str(&contents).unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.version, "0.6.0");
+        assert_eq!(spec.kind, "nvidia.com/gpu");
+        assert_eq!(spec.devices.len(), 2);
+        for (idx, device) in spec.devices.iter().enumerate() {
+            assert_eq!(device.name, idx.to_string());
+            assert_eq!(
+                yaml["devices"][idx]["name"].as_str(),
+                Some(device.name.as_str())
+            );
+            let nodes = device.container_edits.device_nodes.as_ref().unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(
+                Path::new(&nodes[0].path),
+                root.path().join(format!("devices/vfio{}", idx + 8))
+            );
+            assert_eq!(nodes[0].r#type.as_deref(), Some("c"));
+            assert_eq!(nodes[0].permissions.as_deref(), Some("rw"));
+        }
     }
 
     #[test]
@@ -136,14 +148,17 @@ mod tests {
 
         let contents =
             std::fs::read_to_string(cdi_dir.path().join("kata.nvidia.com-gpu.yaml")).unwrap();
-        // Sorted numerically: vfio7, vfio42, vfio100 → indices 0, 1, 2
-        assert!(contents.contains("name: '0'"));
-        assert!(contents.contains("name: '1'"));
-        assert!(contents.contains("name: '2'"));
-        // vfio7 must map to index 0 (it's the lowest)
-        let idx0 = contents.find("name: '0'").unwrap();
-        let vfio7_pos = contents.find("vfio7").unwrap();
-        assert!(vfio7_pos > idx0, "vfio7 should appear after index 0 entry");
+        let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
+        assert_eq!(spec.devices.len(), 3);
+        for (idx, num) in [7, 42, 100].iter().enumerate() {
+            let device = &spec.devices[idx];
+            assert_eq!(device.name, idx.to_string());
+            let nodes = device.container_edits.device_nodes.as_ref().unwrap();
+            assert_eq!(
+                Path::new(&nodes[0].path),
+                root.path().join(format!("devices/vfio{num}"))
+            );
+        }
     }
 
     #[test]

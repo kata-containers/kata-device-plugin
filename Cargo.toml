@@ -15,13 +15,12 @@ path = "src/main.rs"
 anyhow = "1"
 futures = "0.3"
 hyper-util = "0.1"
-# Pinned to the PR #108 merge commit (public spec fields, optional clap,
-# jsonschema without reqwest) until the next crates.io release.
-container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "4de398c8bc49518aa792565a0c62d1b968a7b87c" }
+# Pinned to the serde-saphyr migration until the next crates.io release.
+container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "32972e59702cf2ff5d9851bded87bcc1fd962e65" }
 # No crates.io release with Sysfs yet, so pinned to current main.
 pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca" }
 prost = "0.14"
-serde_yaml = "0.9"
+serde-saphyr = { version = "2", default-features = false, features = ["serialize"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
@@ -34,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca", features = ["testfs"] }
 serde_json = "1"
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 
