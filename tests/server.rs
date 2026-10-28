@@ -16,7 +16,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use pcilibs_rs::testfs::{add as add_dev, add_connectx};
+use pcilibs_rs::testfs::{add as add_dev, add_connectx_cdev};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -62,7 +62,7 @@ fn fake_vfio(n: u32) -> TempDir {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("devices")).unwrap();
     for i in 0..n {
-        add_dev(dir.path(), i, "0x10de", "0x2330", "0x030200");
+        add_dev(dir.path(), i, 0x10de, 0x2330, 0x030200);
     }
     dir
 }
@@ -256,13 +256,7 @@ async fn recovers_from_repeated_kubelet_restarts() -> anyhow::Result<()> {
         // Kubelet unlinks plugin endpoints on startup. Keep the old stream
         // open to ensure endpoint recreation does not wait for it to drain.
         node.stop_kubelet(true).await?;
-        add_dev(
-            node._vfio.path(),
-            restart + 2,
-            "0x10de",
-            "0x2330",
-            "0x030200",
-        );
+        add_dev(node._vfio.path(), restart + 2, 0x10de, 0x2330, 0x030200);
         if restart == 0 {
             tokio::time::sleep(Duration::from_secs(6)).await;
             assert!(node.sockets.path().join("kata-gpu.sock").exists());
@@ -457,7 +451,7 @@ async fn devices_appearing_after_startup_are_published() {
     assert_eq!(first.devices.len(), 0, "must start with zero devices");
 
     // Simulate the VFIO cdev appearing after the DP is already running.
-    add_dev(node._vfio.path(), 0, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 0, 0x10de, 0x2330, 0x030200);
 
     // The poller ticks every POLL_INTERVAL (5 s).  Time is paused
     // (start_paused), so the tick auto-advances as soon as the runtime idles;
@@ -498,7 +492,7 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
         .contains("vfio0"));
 
     remove_dev(node._vfio.path(), 0);
-    add_dev(node._vfio.path(), 5, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 5, 0x10de, 0x2330, 0x030200);
 
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
         .await
@@ -573,7 +567,7 @@ async fn cdi_write_failure_is_retried_next_tick() {
     let spec_path = node.cdi.path().join("kata.nvidia.com-gpu.yaml");
     std::fs::remove_file(&spec_path).unwrap();
     std::fs::create_dir(&spec_path).unwrap();
-    add_dev(node._vfio.path(), 1, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 1, 0x10de, 0x2330, 0x030200);
 
     // The device update must reach the kubelet even while the CDI write fails.
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
@@ -732,28 +726,29 @@ async fn grpc_stubs_respond() {
 }
 
 #[tokio::test]
-async fn gpu_and_nvswitch_filtered_by_pci_class() {
-    // A mixed node: 2 GPUs, 3 NVSwitches, and a VFIO-bound NIC that matches
-    // no RESOURCES row and must not be advertised anywhere.
+async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
+    // A mixed node: 2 GPUs, 3 NVSwitch chips forming one fabric, and a
+    // VFIO-bound NIC that matches no RESOURCES row and must not be
+    // advertised anywhere.
     let vfio = TempDir::new().unwrap();
     for i in 0..2 {
-        add_dev(vfio.path(), i, "0x10de", "0x2330", "0x030200");
+        add_dev(vfio.path(), i, 0x10de, 0x2330, 0x030200);
     }
     for i in 2..5 {
-        add_dev(vfio.path(), i, "0x10de", "0x22a3", "0x068000");
+        add_dev(vfio.path(), i, 0x10de, 0x22a3, 0x068000);
     }
-    add_dev(vfio.path(), 5, "0x15b3", "0x101e", "0x020000");
+    add_dev(vfio.path(), 5, 0x15b3, 0x101e, 0x020000);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
 
-    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch.sock", 3)] {
+    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch-fabric.sock", 1)] {
         let (_stream, resp) = node.snapshot(sock).await;
         assert_eq!(resp.devices.len(), expected, "{sock}");
     }
 
     // Each resource's CDI spec holds only its own devices.
     let gpu = node.spec("kata.nvidia.com-gpu.yaml").unwrap();
-    let sw = node.spec("kata.nvidia.com-nvswitch.yaml").unwrap();
+    let sw = node.spec("kata.nvidia.com-nvswitch-fabric.yaml").unwrap();
     assert!(gpu.contains("devices/vfio0") && gpu.contains("devices/vfio1"));
     assert!(sw.contains("devices/vfio2") && sw.contains("devices/vfio4"));
     assert!(!gpu.contains("devices/vfio2") && !sw.contains("devices/vfio0"));
@@ -764,33 +759,34 @@ async fn gpu_and_nvswitch_filtered_by_pci_class() {
 }
 
 #[tokio::test]
-async fn nvswitch_management_pfs_are_served_as_nvswitch() {
+async fn management_pfs_are_served_as_one_nvswitch_fabric() {
     // HGX B200/B300: the NVSwitches are reached through the management
     // ConnectX, whose PFs are what the Service VM is given.  Two of the four
-    // carry the VPD marker, all four belong, and they are one PCI device, so
-    // the Service VM requests nvidia.com/nvswitch: 1 and gets every function.
-    // A data-path ConnectX of the same vendor and class, VFIO-bound for some
-    // other purpose, must not be advertised.
+    // carry the VPD marker, all four belong, and they are one fabric, so the
+    // Service VM requests nvidia.com/nvswitch-fabric: 1 and gets every
+    // function.  A data-path ConnectX of the same vendor and class,
+    // VFIO-bound for some other purpose, must not be advertised.
     let vfio = fake_vfio(2);
     for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
-        add_connectx(
+        add_connectx_cdev(
             vfio.path(),
             n,
             &format!("0000:05:00.{function}"),
             function < 2,
         );
     }
-    add_connectx(vfio.path(), 6, "0000:18:00.0", false);
+    add_connectx_cdev(vfio.path(), 6, "0000:18:00.0", false);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
 
     let (_gpu_stream, gpus) = node.snapshot("kata-gpu.sock").await;
     assert_eq!(gpus.devices.len(), 2);
-    let (_switch_stream, switches) = node.snapshot("kata-nvswitch.sock").await;
-    assert_eq!(switches.devices.len(), 1);
+    let (_fabric_stream, fabric) = node.snapshot("kata-nvswitch-fabric.sock").await;
+    assert_eq!(fabric.devices.len(), 1);
 
     let spec: Spec =
-        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvswitch.yaml").unwrap()).unwrap();
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvswitch-fabric.yaml").unwrap())
+            .unwrap();
     assert_eq!(spec.devices.len(), 1);
     let nodes = spec.devices[0]
         .container_edits
@@ -808,7 +804,7 @@ async fn nvswitch_management_pfs_are_served_as_nvswitch() {
         .contains("devices/vfio2"));
 
     let resp = node
-        .client("kata-nvswitch.sock")
+        .client("kata-nvswitch-fabric.sock")
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
@@ -820,7 +816,7 @@ async fn nvswitch_management_pfs_are_served_as_nvswitch() {
         .into_inner();
     assert_eq!(
         resp.container_responses[0].cdi_devices[0].name,
-        "nvidia.com/nvswitch=0"
+        "nvidia.com/nvswitch-fabric=0"
     );
 
     node.shutdown().await;
