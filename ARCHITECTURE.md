@@ -2,7 +2,7 @@
 
 ## What this plugin does and does not do
 
-This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` (and `nvidia.com/nvswitch` where NVSwitch devices are bound). It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
+This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` (and `nvidia.com/nvswitch` where NVSwitch devices are bound, or the management ConnectX PFs that represent them on HGX B200/B300). It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
 
 A clash with another plugin advertising `nvidia.com/gpu` is intentional and detects misconfiguration: trusted and untrusted workloads do not share a cluster, so on a Kata/untrusted cluster nothing else exposes this resource.
 
@@ -13,6 +13,10 @@ The plugin talks only to the kubelet, over unix sockets. It has no Kubernetes AP
 **HGX H100, HGX B200/B300, GB200 NVL72, GB300, Vera Rubin.**
 
 GPUs (and NVSwitches, where the platform has them) are passed through to Kata VMs via VFIO. The plugin enumerates IOMMUFD cdevs under `/dev/vfio/devices/`, classifies each via `/sys/class/vfio-dev/vfioN/device` PCI vendor/class, and advertises each as one device of the matching resource.
+
+## Service VM
+
+NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests every `nvidia.com/nvswitch` device the node advertises. On HGX H100/H200 those are the four NVSwitch bridge functions. On HGX B200/B300 the NVSwitches are reached through a management ConnectX, and its PFs are the devices NVIDIA's integration guide passes to the Service VM, so the plugin advertises them under the same name. Telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads; the plugin stays a sysfs reader and binds nothing. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image serves both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
 
 ## Out of scope: multi-node NVLink (IMEX)
 
@@ -58,7 +62,7 @@ The isolation primitive for untrusted workloads is the VM or CVM boundary, not p
 
 ## Cluster shape
 
-This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices and configure the NVLink fabric.
+This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices. NVLink fabric configuration runs in the Service VM, a Kata pod in the workload cluster that holds the node's `nvidia.com/nvswitch` devices.
 
 ```text
 Admin cluster                        Workload cluster
@@ -66,4 +70,5 @@ Admin cluster                        Workload cluster
 GPU Operator (driver, MIG, fabric)   kata-device-plugin (declares only)
 VFIO binder                          Kata VMs
                                      Workload pods requesting nvidia.com/gpu
+                                     Service VM pod requesting nvidia.com/nvswitch
 ```

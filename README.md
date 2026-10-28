@@ -15,9 +15,25 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 | --- | --- |
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
 | `nvidia.com/nvswitch` | `0x10de`, class `0x0680xx` (bridge: other) |
+| `nvidia.com/nvswitch` | `0x15b3`, class `0x0207xx` (InfiniBand controller), NVSwitch management PFs only |
+
+On HGX H100/H200 the NVSwitches are PCI bridge functions. On HGX B200/B300
+they sit behind a management ConnectX and are represented by its PFs, two or
+four depending on firmware, and those PFs are what a Service VM running
+Fabric Manager is given ([HGX Shared NVSwitch guide][hgx-guide], sections
+2.5.2.2 and 3.2.2). Vendor and class cannot tell them from the node's
+data-path ConnectX NICs, so the third row is gated on the role pcilibs-rs
+reads from PCI VPD: every PF on a slot where one PF carries the exact
+`SMDL=SW_MNG` field. The scan runs only while such a cdev is bound, and an
+unreadable VPD advertises no management PF until the next poll. The name is
+the same on both platforms, so a Service VM pod requests
+`nvidia.com/nvswitch` everywhere and only the count differs.
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
-lists those rows for tools that need the resource names and PCI matches.
+lists those rows, with the `nvswitchManagement` gate, for tools that need
+the resource names and PCI matches.
+
+[hgx-guide]: https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf
 
 A resource is advertised iff matching devices are VFIO-bound — declared by
 the node, not configured. Supporting a new device type is one table row; no
@@ -139,8 +155,9 @@ publishing.
 The DaemonSet mounts three host paths: the kubelet device-plugin socket
 directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
-root filesystem — root is required only because the kubelet owns its
-socket directory.
+root filesystem — root is required because the kubelet owns its socket
+directory and because PCI VPD, which identifies the NVSwitch management PFs,
+is a root-only sysfs attribute.
 
 ## Releasing
 
