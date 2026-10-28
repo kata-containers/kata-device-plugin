@@ -16,7 +16,7 @@ GPUs (and NVSwitches, where the platform has them) are passed through to Kata VM
 
 ## Service VM
 
-NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests every `nvidia.com/nvswitch` device the node advertises. On HGX H100/H200 those are the four NVSwitch bridge functions. On HGX B200/B300 the NVSwitches are reached through a management ConnectX, and its PFs are the devices NVIDIA's integration guide passes to the Service VM, so the plugin advertises them under the same name. Telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads; the plugin stays a sysfs reader and binds nothing. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image serves both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
+NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests every `nvidia.com/nvswitch` device the node advertises. On HGX H100/H200 those are four devices, one per NVSwitch chip. On HGX B200/B300 the NVSwitches are reached through a management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together, so the plugin advertises that ConnectX as one device under the same name, with every PF in its CDI entry. Telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads; the plugin stays a sysfs reader and binds nothing. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image serves both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
 
 ## Out of scope: multi-node NVLink (IMEX)
 
@@ -51,6 +51,8 @@ DRA earns its place when there are real topology constraints — heterogeneous f
 Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consumption policy, and that decision belongs to the layer above. The scheduler is free to consume the declared devices as a whole (`nvidia.com/gpu: 4` on a GB200 compute tray is the whole tray) or as a subset (`nvidia.com/gpu: 2`); the plugin does not pre-empt that choice by bundling devices into units. Whole-node intent is a count plus node labels and taints, expressed in pod specs and placement policy.
 
 The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
+
+The unit of advertisement is the PCI device, not the PCI function. A multi-function device such as the B200/B300 management ConnectX is one device whose CDI entry carries every function, because no consumer can take a function without its siblings; that is identity, not aggregation. Grouping several PCI devices, such as the four H100 NVSwitch chips, would be an aggregate and stays out.
 
 ### Why the plugin does not bind VFIO devices
 
