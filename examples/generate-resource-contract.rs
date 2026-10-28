@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "pciDeviceId": resource.device.map(|id| format!("0x{id:04x}")),
                 "pciClassPrefix": format!("0x{:04x}", resource.class_prefix),
                 "nvswitchManagement": resource.nvswitch_management,
+                "unit": resource.unit.as_str(),
             })
         })
         .collect();

@@ -15,21 +15,24 @@
         "nvswitchManagement": false,
         "pciClassPrefix": "0x0302",
         "pciDeviceId": null,
-        "pciVendorId": "0x10de"
+        "pciVendorId": "0x10de",
+        "unit": "pci-device"
       },
       {
-        "name": "nvidia.com/nvswitch",
+        "name": "nvidia.com/nvswitch-fabric",
         "nvswitchManagement": false,
         "pciClassPrefix": "0x0680",
         "pciDeviceId": null,
-        "pciVendorId": "0x10de"
+        "pciVendorId": "0x10de",
+        "unit": "fabric"
       },
       {
-        "name": "nvidia.com/nvswitch",
+        "name": "nvidia.com/nvswitch-fabric",
         "nvswitchManagement": true,
         "pciClassPrefix": "0x0207",
         "pciDeviceId": null,
-        "pciVendorId": "0x15b3"
+        "pciVendorId": "0x15b3",
+        "unit": "fabric"
       }
     ],
     "default": "alias",

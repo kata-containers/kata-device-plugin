@@ -185,21 +185,21 @@ mod tests {
             testfs::add_nvswitch(root.path(), n);
         }
         let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
-            .remove("nvidia.com/nvswitch")
+            .remove("nvidia.com/nvswitch-fabric")
             .unwrap_or_default();
 
-        write_cdi_spec("nvidia.com/nvswitch", &devs, cdi_dir.path()).unwrap();
+        write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
 
         assert!(cdi_dir
             .path()
-            .join("kata.nvidia.com-nvswitch.yaml")
+            .join("kata.nvidia.com-nvswitch-fabric.yaml")
             .exists());
     }
 
     #[test]
-    fn multi_function_device_is_one_cdi_device_with_a_node_per_function() {
-        // The B200/B300 management ConnectX: four PFs, one PCI device.  The
-        // shim must inject all of them from one CDI name.
+    fn fabric_is_one_cdi_device_with_a_node_per_function() {
+        // The B200/B300 management ConnectX: four PFs, one fabric.  The shim
+        // must inject all of them from one CDI name.
         let root = TempDir::new().unwrap();
         let cdi_dir = TempDir::new().unwrap();
         for function in 0..4u32 {
@@ -211,13 +211,14 @@ mod tests {
             );
         }
         let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
-            .remove("nvidia.com/nvswitch")
+            .remove("nvidia.com/nvswitch-fabric")
             .unwrap_or_default();
 
-        write_cdi_spec("nvidia.com/nvswitch", &devs, cdi_dir.path()).unwrap();
+        write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
 
         let contents =
-            std::fs::read_to_string(cdi_dir.path().join("kata.nvidia.com-nvswitch.yaml")).unwrap();
+            std::fs::read_to_string(cdi_dir.path().join("kata.nvidia.com-nvswitch-fabric.yaml"))
+                .unwrap();
         let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
         validate_spec(&spec).unwrap();
         assert_eq!(spec.devices.len(), 1);
