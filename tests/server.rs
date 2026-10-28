@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use container_device_interface::specs::config::Spec;
 use kata_device_plugin::dp::v1beta1::{
     device_plugin_client::DevicePluginClient,
     registration_server::{Registration, RegistrationServer},
@@ -766,9 +767,10 @@ async fn gpu_and_nvswitch_filtered_by_pci_class() {
 async fn nvswitch_management_pfs_are_served_as_nvswitch() {
     // HGX B200/B300: the NVSwitches are reached through the management
     // ConnectX, whose PFs are what the Service VM is given.  Two of the four
-    // carry the VPD marker, all four belong.  A data-path ConnectX of the
-    // same vendor and class, VFIO-bound for some other purpose, must not be
-    // advertised.
+    // carry the VPD marker, all four belong, and they are one PCI device, so
+    // the Service VM requests nvidia.com/nvswitch: 1 and gets every function.
+    // A data-path ConnectX of the same vendor and class, VFIO-bound for some
+    // other purpose, must not be advertised.
     let vfio = fake_vfio(2);
     for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
         add_connectx(
@@ -785,20 +787,41 @@ async fn nvswitch_management_pfs_are_served_as_nvswitch() {
     let (_gpu_stream, gpus) = node.snapshot("kata-gpu.sock").await;
     assert_eq!(gpus.devices.len(), 2);
     let (_switch_stream, switches) = node.snapshot("kata-nvswitch.sock").await;
-    assert_eq!(switches.devices.len(), 4);
+    assert_eq!(switches.devices.len(), 1);
 
-    let spec = node.spec("kata.nvidia.com-nvswitch.yaml").unwrap();
-    for n in 2..6 {
-        assert!(
-            spec.contains(&format!("devices/vfio{n}")),
-            "vfio{n} missing"
-        );
-    }
-    assert!(!spec.contains("devices/vfio6"), "data-path NIC advertised");
+    let spec: Spec =
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvswitch.yaml").unwrap()).unwrap();
+    assert_eq!(spec.devices.len(), 1);
+    let nodes = spec.devices[0]
+        .container_edits
+        .device_nodes
+        .as_ref()
+        .unwrap();
+    let cdevs: Vec<&str> = nodes
+        .iter()
+        .map(|node| node.path.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(cdevs, ["vfio2", "vfio3", "vfio4", "vfio5"]);
     assert!(!node
         .spec("kata.nvidia.com-gpu.yaml")
         .unwrap()
         .contains("devices/vfio2"));
+
+    let resp = node
+        .client("kata-nvswitch.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["0".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.container_responses[0].cdi_devices[0].name,
+        "nvidia.com/nvswitch=0"
+    );
 
     node.shutdown().await;
 }

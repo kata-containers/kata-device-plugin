@@ -5,7 +5,7 @@ use container_device_interface::spec::validate_spec;
 use container_device_interface::specs::config::{ContainerEdits, Device, DeviceNode, Spec};
 use tracing::info;
 
-use pcilibs_rs::IommufdDev;
+use crate::vfio;
 
 /// Path of the CDI spec file for `resource_name` inside `cdi_dir`:
 /// "nvidia.com/gpu" → `<cdi_dir>/kata.nvidia.com-gpu.yaml`.  The `kata.`
@@ -17,11 +17,12 @@ pub fn spec_path(cdi_dir: &Path, resource_name: &str) -> PathBuf {
 /// Write the host CDI spec mapping index `i` → `devices[i]` — the same IDs
 /// the plugin advertises.  Kata's shim reads this registry at SandboxCreate
 /// to resolve `nvidia.com/gpu=0` → `/dev/vfio/devices/vfio<N>` for VFIO
-/// passthrough into the hypervisor.  The CDI `kind` is the extended-resource
-/// name itself.
+/// passthrough into the hypervisor.  Every bound function of a device is a
+/// device node, so a multi-function PCI device is injected whole.  The CDI
+/// `kind` is the extended-resource name itself.
 pub fn write_cdi_spec(
     resource_name: &str,
-    devices: &[IommufdDev],
+    devices: &[vfio::Device],
     cdi_dir: &Path,
 ) -> anyhow::Result<()> {
     if devices.is_empty() {
@@ -41,12 +42,16 @@ pub fn write_cdi_spec(
             .map(|(idx, dev)| Device {
                 name: idx.to_string(),
                 container_edits: ContainerEdits {
-                    device_nodes: Some(vec![DeviceNode {
-                        path: dev.path.to_string_lossy().into_owned(),
-                        r#type: Some("c".to_owned()),
-                        permissions: Some("rw".to_owned()),
-                        ..Default::default()
-                    }]),
+                    device_nodes: Some(
+                        dev.iter()
+                            .map(|function| DeviceNode {
+                                path: function.path.to_string_lossy().into_owned(),
+                                r#type: Some("c".to_owned()),
+                                permissions: Some("rw".to_owned()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -87,10 +92,9 @@ pub fn write_cdi_spec(
 mod tests {
     use super::*;
     use crate::vfio::{self, testfs, Naming, Sysfs};
-    use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
 
-    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<IommufdDev> {
+    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<vfio::Device> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
@@ -190,5 +194,43 @@ mod tests {
             .path()
             .join("kata.nvidia.com-nvswitch.yaml")
             .exists());
+    }
+
+    #[test]
+    fn multi_function_device_is_one_cdi_device_with_a_node_per_function() {
+        // The B200/B300 management ConnectX: four PFs, one PCI device.  The
+        // shim must inject all of them from one CDI name.
+        let root = TempDir::new().unwrap();
+        let cdi_dir = TempDir::new().unwrap();
+        for function in 0..4u32 {
+            testfs::add_connectx(
+                root.path(),
+                function,
+                &format!("0000:05:00.{function}"),
+                function < 2,
+            );
+        }
+        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
+            .remove("nvidia.com/nvswitch")
+            .unwrap_or_default();
+
+        write_cdi_spec("nvidia.com/nvswitch", &devs, cdi_dir.path()).unwrap();
+
+        let contents =
+            std::fs::read_to_string(cdi_dir.path().join("kata.nvidia.com-nvswitch.yaml")).unwrap();
+        let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.devices.len(), 1);
+        assert_eq!(spec.devices[0].name, "0");
+        let nodes = spec.devices[0]
+            .container_edits
+            .device_nodes
+            .as_ref()
+            .unwrap();
+        let cdevs: Vec<&str> = nodes
+            .iter()
+            .map(|node| node.path.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(cdevs, ["vfio0", "vfio1", "vfio2", "vfio3"]);
     }
 }

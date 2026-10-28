@@ -4,6 +4,13 @@ use std::path::Path;
 
 pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
+/// One advertised device: every bound function of one PCI device, in cdev
+/// order.  Functions are never advertised separately, because no consumer
+/// can take one without its siblings (the B200/B300 management ConnectX is
+/// one device with two or four PFs), so this is both the unit the kubelet
+/// schedules and the CDI device the shim injects.
+pub type Device = Vec<IommufdDev>;
+
 /// How advertised resource names are derived (--resource-naming flag).
 #[derive(Clone, Copy, Debug)]
 pub enum Naming {
@@ -104,16 +111,15 @@ pub const RESOURCES: &[Resource] = &[
     },
 ];
 
-/// Enumerate all IOMMUFD cdevs and group them by advertised resource name.
-/// Rows are first-match-wins per device, so every cdev lands in exactly one
-/// resource; devices within a name keep numeric cdev order, which fixes the
-/// advertised device IDs / CDI spec indices.
-pub fn discover(
-    vfio_dir: &Path,
-    sysfs: &Sysfs,
-    naming: Naming,
-) -> BTreeMap<String, Vec<IommufdDev>> {
-    let mut map: BTreeMap<String, Vec<IommufdDev>> = BTreeMap::new();
+/// Enumerate all IOMMUFD cdevs and group them into advertised devices by
+/// resource name.  Rows are first-match-wins per cdev, so every cdev lands
+/// in exactly one resource; within a name the functions of one PCI device
+/// form one device, and devices keep the numeric order of their first cdev,
+/// which fixes the advertised device IDs / CDI spec indices.
+pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Device>> {
+    // Grouped by name, then by PCI slot within the name, so the functions of
+    // one device land together however their cdevs are numbered.
+    let mut grouped: BTreeMap<String, Vec<(String, Device)>> = BTreeMap::new();
     // The topology scan reads every Mellanox PF's VPD, so it runs at most
     // once per pass, and not at all unless a gated row has a candidate.
     let management: OnceCell<Vec<String>> = OnceCell::new();
@@ -131,9 +137,25 @@ pub fn discover(
             Naming::Alias => row.name.to_owned(),
             Naming::Sku => sku_name(row, &dev),
         };
-        map.entry(name).or_default().push(dev);
+        let slot = slot(&dev.bdf).to_owned();
+        let devices = grouped.entry(name).or_default();
+        match devices.iter_mut().find(|(s, _)| *s == slot) {
+            Some((_, device)) => device.push(dev),
+            None => devices.push((slot, vec![dev])),
+        }
     }
-    map
+    grouped
+        .into_iter()
+        .map(|(name, devices)| {
+            let devices = devices.into_iter().map(|(_, device)| device).collect();
+            (name, devices)
+        })
+        .collect()
+}
+
+/// `0000:27:00.1` → `0000:27:00`: the PCI device its functions share.
+fn slot(bdf: &str) -> &str {
+    bdf.rsplit_once('.').map_or(bdf, |(slot, _)| slot)
 }
 
 /// BDFs of the node's NVSwitch management PFs.  The scan fails closed: an
@@ -226,8 +248,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn nums(devs: &[IommufdDev]) -> Vec<u32> {
-        devs.iter().map(|d| d.num).collect()
+    /// Cdev numbers per advertised device.
+    fn nums(devices: &[Device]) -> Vec<Vec<u32>> {
+        devices
+            .iter()
+            .map(|device| device.iter().map(|cdev| cdev.num).collect())
+            .collect()
     }
 
     #[test]
@@ -241,9 +267,9 @@ mod tests {
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![7, 42]);
-        assert!(map["nvidia.com/gpu"][0].path.ends_with("devices/vfio7"));
-        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![9]);
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![7], vec![42]]);
+        assert!(map["nvidia.com/gpu"][0][0].path.ends_with("devices/vfio7"));
+        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![vec![9]]);
     }
 
     #[test]
@@ -262,7 +288,7 @@ mod tests {
             "unexpected SKU name: {name}"
         );
         assert!(!name.contains(['[', ']', ' ']), "unsanitized: {name}");
-        assert_eq!(nums(devs), vec![0, 1]);
+        assert_eq!(nums(devs), vec![vec![0], vec![1]]);
     }
 
     #[test]
@@ -313,25 +339,29 @@ mod tests {
     }
 
     #[test]
-    fn management_pfs_join_the_nvswitch_resource() {
+    fn management_pfs_are_one_nvswitch_device() {
         let root = TempDir::new().unwrap();
         let r = root.path();
         testfs::add_gpu(r, 0);
         // The management ConnectX: the two limited PFs carry the marker, the
-        // two full-capability siblings do not, and all four belong.
-        for (n, function, marker) in [(1, 0, true), (2, 1, true), (3, 2, false), (4, 3, false)] {
+        // two full-capability siblings do not, and all four belong.  Their
+        // cdev numbers interleave with an H100-style NVSwitch bridge, which
+        // is its own PCI device and so its own advertised device.
+        for (n, function, marker) in [(1, 0, true), (3, 1, true), (4, 2, false), (5, 3, false)] {
             testfs::add_connectx(r, n, &format!("0000:05:00.{function}"), marker);
         }
+        testfs::add_nvswitch(r, 2);
         // A data-path ConnectX on another slot: same vendor and class, no
         // role.  It must not be advertised anywhere.
-        testfs::add_connectx(r, 5, "0000:18:00.0", false);
-        // An H100-style NVSwitch bridge lands in the same resource.
-        testfs::add_nvswitch(r, 6);
+        testfs::add_connectx(r, 6, "0000:18:00.0", false);
 
         let map = discover(r, &Sysfs::new(r), Naming::Alias);
         assert_eq!(map.len(), 2);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![0]);
-        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![1, 2, 3, 4, 6]);
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
+        assert_eq!(
+            nums(&map["nvidia.com/nvswitch"]),
+            vec![vec![1, 3, 4, 5], vec![2]]
+        );
     }
 
     #[test]
@@ -350,7 +380,7 @@ mod tests {
 
         let map = discover(r, &Sysfs::new(r), Naming::Alias);
         assert_eq!(map.len(), 1);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![0]);
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
     }
 
     #[test]
