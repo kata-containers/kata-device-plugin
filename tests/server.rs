@@ -481,6 +481,28 @@ fn remove_dev(root: &std::path::Path, n: u32) {
     std::fs::remove_dir_all(Sysfs::new(root).vfio_dev(&format!("vfio{n}"))).unwrap();
 }
 
+/// A ConnectX-7 InfiniBand PF cdev laid out the way the kernel does it: the
+/// function under `bus/pci/devices/<bdf>` with identity files and VPD, and
+/// the vfio-dev `device` entry a symlink to it, which is what the plugin's
+/// BDF resolution and pcilibs-rs's VPD scan read.
+fn add_connectx(root: &std::path::Path, n: u32, bdf: &str, vpd: &[u8]) {
+    let sysfs = Sysfs::new(root);
+    let function = sysfs.device(bdf).unwrap();
+    std::fs::create_dir_all(&function).unwrap();
+    for (file, value) in [
+        ("vendor", "0x15b3"),
+        ("device", "0x1021"),
+        ("class", "0x020700"),
+    ] {
+        std::fs::write(function.join(file), format!("{value}\n")).unwrap();
+    }
+    std::fs::write(function.join("vpd"), vpd).unwrap();
+    std::fs::write(root.join("devices").join(format!("vfio{n}")), b"").unwrap();
+    let vfio_dev = sysfs.vfio_dev(&format!("vfio{n}"));
+    std::fs::create_dir_all(&vfio_dev).unwrap();
+    std::os::unix::fs::symlink(&function, vfio_dev.join("device")).unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn same_count_device_swap_refreshes_cdi_spec() {
     // vfio0 is replaced by vfio5 between polls.  The advertised Device list
@@ -758,6 +780,45 @@ async fn gpu_and_nvswitch_filtered_by_pci_class() {
     assert!(!gpu.contains("devices/vfio2") && !sw.contains("devices/vfio0"));
     // The NIC appears in neither.
     assert!(!gpu.contains("devices/vfio5") && !sw.contains("devices/vfio5"));
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn nvswitch_management_pfs_are_served_as_nvswitch() {
+    // HGX B200/B300: the NVSwitches are reached through the management
+    // ConnectX, whose PFs are what the Service VM is given.  Two of the four
+    // carry the VPD marker, all four belong.  A data-path ConnectX of the
+    // same vendor and class, VFIO-bound for some other purpose, must not be
+    // advertised.
+    const SW_MNG: &[u8] = b"\x90\x0e\x00VA\x0bSMDL=SW_MNG\x78";
+    const NO_ROLE: &[u8] = b"\x90\x0e\x00VA\x0bMLX:MN=MLNX\x78";
+    let vfio = fake_vfio(2);
+    for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
+        let vpd = if function < 2 { SW_MNG } else { NO_ROLE };
+        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), vpd);
+    }
+    add_connectx(vfio.path(), 6, "0000:18:00.0", NO_ROLE);
+
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
+
+    let (_gpu_stream, gpus) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(gpus.devices.len(), 2);
+    let (_switch_stream, switches) = node.snapshot("kata-nvswitch.sock").await;
+    assert_eq!(switches.devices.len(), 4);
+
+    let spec = node.spec("kata.nvidia.com-nvswitch.yaml").unwrap();
+    for n in 2..6 {
+        assert!(
+            spec.contains(&format!("devices/vfio{n}")),
+            "vfio{n} missing"
+        );
+    }
+    assert!(!spec.contains("devices/vfio6"), "data-path NIC advertised");
+    assert!(!node
+        .spec("kata.nvidia.com-gpu.yaml")
+        .unwrap()
+        .contains("devices/vfio2"));
 
     node.shutdown().await;
 }
