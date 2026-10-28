@@ -1,5 +1,5 @@
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use pcilibs_rs::platform::Topology;
@@ -82,20 +82,14 @@ pub struct Resource {
     /// Base class and subclass (upper 16 bits of the 24-bit class code),
     /// e.g. `0x0302` for 3D controller.
     pub class_prefix: u16,
-    /// Admit only the PCI functions pcilibs-rs identifies as NVSwitch
-    /// management PFs: every PF on a ConnectX slot whose VPD carries the
-    /// exact `SMDL=SW_MNG` field (HGX Shared NVSwitch guide 19.0, section
-    /// 2.5.2.2).  On HGX B200/B300 the NVSwitches are reached through these
-    /// PFs, but the node's data-path ConnectX NICs share their vendor and
-    /// class and must stay unadvertised, so (vendor, class) alone cannot be
-    /// the row.
-    pub nvswitch_management: bool,
-    /// What one advertised device of this row spans.
+    /// What one advertised device of this row spans.  A fabric row admits a
+    /// cdev only when pcilibs-rs's topology scan names its function, so
+    /// (vendor, class) says which cdevs may join and the scan says which do.
     pub unit: Unit,
 }
 
 impl Resource {
-    /// PCI identity match.  The management gate is applied by `discover`,
+    /// PCI identity match.  Fabric membership is applied by `discover`,
     /// which owns the one topology scan per pass.
     fn matches(&self, dev: &IommufdDev) -> bool {
         dev.vendor == self.vendor
@@ -116,7 +110,6 @@ pub const RESOURCES: &[Resource] = &[
         vendor: 0x10de,
         device: None,
         class_prefix: 0x0302, // 3D controller
-        nvswitch_management: false,
         unit: Unit::PciDevice,
     },
     // The NVSwitch fabric a Service VM running Fabric Manager takes whole
@@ -127,18 +120,18 @@ pub const RESOURCES: &[Resource] = &[
         vendor: 0x10de,
         device: None,
         class_prefix: 0x0680, // bridge: other
-        nvswitch_management: false,
         unit: Unit::Fabric,
     },
     // On HGX B200/B300 the NVSwitches "are represented as full and limited
     // capability PFs under the management Mellanox ConnectX" (section
-    // 3.2.2.2), so those PFs are the same fabric, not a second name.
+    // 3.2.2.2), so those PFs are the same fabric, not a second name.  The
+    // node's data-path ConnectX NICs share this identity; pcilibs-rs tells
+    // them apart by the VPD role the guide documents.
     Resource {
         name: "nvidia.com/nvswitch-fabric",
         vendor: 0x15b3,
         device: None,
         class_prefix: 0x0207, // InfiniBand controller
-        nvswitch_management: true,
         unit: Unit::Fabric,
     },
 ];
@@ -146,87 +139,96 @@ pub const RESOURCES: &[Resource] = &[
 /// Enumerate all IOMMUFD cdevs and group them into advertised devices by
 /// resource name.  Rows are first-match-wins per cdev, so every cdev lands
 /// in exactly one resource.  Within a name the row's unit decides the
-/// grouping, and devices keep the numeric order of their first cdev, which
-/// fixes the advertised device IDs / CDI spec indices.  A fabric is
-/// advertised whole or not at all.
+/// grouping: PCI-device rows order their devices by PCI address, which
+/// survives a reboot where cdev numbers do not, and a fabric is one device,
+/// advertised whole or not at all.  That order fixes the advertised device
+/// IDs / CDI spec indices.
 pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Device>> {
-    // Grouped by name, then by unit key within the name: the PCI slot, so
-    // the functions of one device land together however their cdevs are
-    // numbered, or one key for the whole fabric.
-    let mut grouped: BTreeMap<String, Vec<(String, Device)>> = BTreeMap::new();
+    // Name, then PCI slot, then the slot's bound functions.  No row has a
+    // multi-function PCI device today; the slot is the principle
+    // ARCHITECTURE.md states, functions are never separate devices, and the
+    // order key.
+    let mut pci: BTreeMap<String, BTreeMap<String, Device>> = BTreeMap::new();
+    let mut fabrics: BTreeMap<String, Device> = BTreeMap::new();
     // The topology scan reads every Mellanox PF's VPD, so it runs at most
     // once per pass, and not at all unless a fabric row has a candidate.
     let scanned: OnceCell<Option<Topology>> = OnceCell::new();
     let topology = || scanned.get_or_init(|| fabric_topology(sysfs)).as_ref();
     for dev in pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs) {
+        // A fabric row admits a cdev only when the scan names its function,
+        // so the fabric has one definition, the scan's, which NVRC reads in
+        // the guest too.
         let Some(row) = RESOURCES.iter().find(|r| {
             r.matches(&dev)
-                && (!r.nvswitch_management
-                    || topology()
-                        .is_some_and(|t| t.management_functions.iter().any(|f| f.bdf == dev.bdf)))
+                && (r.unit != Unit::Fabric
+                    || topology().is_some_and(|t| fabric(t).any(|bdf| bdf == dev.bdf)))
         }) else {
             continue;
         };
-        // A fabric spans PCI devices, so one function's SKU would misname
-        // it; fabric rows keep their alias in both modes.
-        let name = match (naming, row.unit) {
-            (Naming::Sku, Unit::PciDevice) => sku_name(row, &dev),
-            _ => row.name.to_owned(),
-        };
-        let key = match row.unit {
-            Unit::PciDevice => slot(&dev.bdf).to_owned(),
-            Unit::Fabric => String::new(),
-        };
-        let devices = grouped.entry(name).or_default();
-        match devices.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, device)) => device.push(dev),
-            None => devices.push((key, vec![dev])),
+        match row.unit {
+            Unit::PciDevice => {
+                let name = match naming {
+                    Naming::Alias => row.name.to_owned(),
+                    Naming::Sku => sku_name(row, &dev),
+                };
+                let slot = slot(&dev.bdf).to_owned();
+                pci.entry(name)
+                    .or_default()
+                    .entry(slot)
+                    .or_default()
+                    .push(dev);
+            }
+            // A fabric spans PCI devices, so one function's SKU would misname
+            // it; fabric rows keep their alias in both modes.
+            Unit::Fabric => fabrics.entry(row.name.to_owned()).or_default().push(dev),
         }
     }
     // A Service VM holding part of a fabric cannot bring it up, and the
     // kubelet cannot be told to wait, so the one device exists only once
-    // every switch function the node has is bound.
-    grouped.retain(|name, devices| {
-        if !RESOURCES
-            .iter()
-            .any(|r| r.unit == Unit::Fabric && r.name == name)
-        {
-            return true;
-        }
-        let bound: BTreeSet<&str> = devices
-            .iter()
-            .flat_map(|(_, device)| device.iter().map(|cdev| cdev.bdf.as_str()))
+    // every function the scan names is bound.  Admission needed the scan, so
+    // a fabric here always has one, and its bound functions are a subset of
+    // the named ones by construction.
+    fabrics.retain(|name, device| {
+        let missing: Vec<&str> = topology()
+            .into_iter()
+            .flat_map(fabric)
+            .filter(|bdf| !device.iter().any(|cdev| cdev.bdf == *bdf))
             .collect();
-        let whole = topology().is_some_and(|t| {
-            let present: BTreeSet<&str> = t
-                .switches
-                .iter()
-                .map(String::as_str)
-                .chain(t.management_functions.iter().map(|f| f.bdf.as_str()))
-                .collect();
-            present == bound
-        });
-        if !whole {
+        if !missing.is_empty() {
             tracing::warn!(
                 resource = %name,
-                bound = bound.len(),
+                bound = device.len(),
+                present = device.len() + missing.len(),
+                ?missing,
                 "NVSwitch fabric is not completely bound, advertising none"
             );
         }
-        whole
+        missing.is_empty()
     });
-    grouped
-        .into_iter()
-        .map(|(name, devices)| {
-            let devices = devices.into_iter().map(|(_, device)| device).collect();
-            (name, devices)
-        })
+    pci.into_iter()
+        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .chain(
+            fabrics
+                .into_iter()
+                .map(|(name, device)| (name, vec![device])),
+        )
         .collect()
 }
 
 /// `0000:27:00.1` → `0000:27:00`: the PCI device its functions share.
 fn slot(bdf: &str) -> &str {
     bdf.rsplit_once('.').map_or(bdf, |(slot, _)| slot)
+}
+
+/// The fabric a Service VM is given whole (HGX guide 19.0, section 3.2.2):
+/// the switch chips where they are PCI functions, the management ConnectX
+/// PFs where they are not.
+fn fabric(topology: &Topology) -> impl Iterator<Item = &str> {
+    topology
+        .switches
+        .iter()
+        .map(String::as_str)
+        .chain(topology.management_functions.iter().map(|f| f.bdf.as_str()))
 }
 
 /// The node's switch chips and NVSwitch management PFs, bound or not.  The
@@ -378,7 +380,6 @@ mod tests {
                 vendor: 0x10de,
                 device: Some(0x2330),
                 class_prefix: 0x0302,
-                nvswitch_management: false,
                 unit: Unit::PciDevice,
             },
             Resource {
@@ -386,7 +387,6 @@ mod tests {
                 vendor: 0x10de,
                 device: None,
                 class_prefix: 0x0302,
-                nvswitch_management: false,
                 unit: Unit::PciDevice,
             },
         ];

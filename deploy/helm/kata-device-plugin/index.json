@@ -12,7 +12,6 @@
     "aliasResources": [
       {
         "name": "nvidia.com/gpu",
-        "nvswitchManagement": false,
         "pciClassPrefix": "0x0302",
         "pciDeviceId": null,
         "pciVendorId": "0x10de",
@@ -20,7 +19,6 @@
       },
       {
         "name": "nvidia.com/nvswitch-fabric",
-        "nvswitchManagement": false,
         "pciClassPrefix": "0x0680",
         "pciDeviceId": null,
         "pciVendorId": "0x10de",
@@ -28,7 +26,6 @@
       },
       {
         "name": "nvidia.com/nvswitch-fabric",
-        "nvswitchManagement": true,
         "pciClassPrefix": "0x0207",
         "pciDeviceId": null,
         "pciVendorId": "0x15b3",

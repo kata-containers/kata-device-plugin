@@ -20,10 +20,12 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 On HGX H100/H200 the NVSwitches are PCI bridge functions. On HGX B200/B300
 they sit behind a management ConnectX and are represented by its PFs, two or
 four depending on firmware ([HGX Shared NVSwitch guide][hgx-guide], sections
-2.5.2.2 and 3.2.2). Vendor and class cannot tell those PFs from the node's
-data-path ConnectX NICs, so that row is gated on the role pcilibs-rs reads
-from PCI VPD: every PF on a slot where one PF carries the exact
-`SMDL=SW_MNG` field.
+2.5.2.2 and 3.2.2). Which functions make up the fabric is decided once, by
+pcilibs-rs's topology scan: the switch chips by PCI identity, the management
+PFs by the role the guide documents, every PF on a slot where one PF's VPD
+carries the exact `SMDL=SW_MNG` field. The rows only say which cdevs may
+join, which is how the data-path ConnectX NICs sharing their identity stay
+out.
 
 The fabric is one device on every platform. A Service VM running Fabric
 Manager takes all of the node's switch functions or none, so
@@ -39,8 +41,8 @@ per PCI device.
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
 lists those rows for tools that need the resource names and PCI matches: one
-entry per PCI identity with its `unit` and `nvswitchManagement` gate, so
-`nvidia.com/nvswitch-fabric` appears twice.
+entry per PCI identity with its `unit`, so `nvidia.com/nvswitch-fabric`
+appears twice.
 
 [hgx-guide]: https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf
 
