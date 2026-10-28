@@ -240,23 +240,19 @@ pub(crate) mod testfs {
     /// The same vendor field on a data-path ConnectX: a VPD, no role.
     pub const NIC_VPD: &[u8] = b"\x90\x0e\x00VA\x0bMLX:MN=MLNX\x78";
 
-    /// A cdev backed by a PCI function laid out the way the kernel does it:
-    /// the function under `bus/pci/devices/<bdf>` with its identity files
-    /// and optional VPD, and the vfio-dev `device` entry a symlink to it,
-    /// which is what BDF resolution and the VPD scan read.
-    pub fn add_function(
-        root: &Path,
-        n: u32,
-        bdf: &str,
-        vendor: &str,
-        device: &str,
-        class: &str,
-        vpd: Option<&[u8]>,
-    ) {
+    /// A ConnectX-7 InfiniBand PF cdev (15b3:1021) laid out the way the
+    /// kernel does it: the function under `bus/pci/devices/<bdf>` with its
+    /// identity files and optional VPD, and the vfio-dev `device` entry a
+    /// symlink to it, which is what BDF resolution and the VPD scan read.
+    pub fn add_connectx(root: &Path, n: u32, bdf: &str, vpd: Option<&[u8]>) {
         let sysfs = Sysfs::new(root);
         let function = sysfs.device(bdf).unwrap();
         fs::create_dir_all(&function).unwrap();
-        for (file, value) in [("vendor", vendor), ("device", device), ("class", class)] {
+        for (file, value) in [
+            ("vendor", "0x15b3"),
+            ("device", "0x1021"),
+            ("class", "0x020700"),
+        ] {
             fs::write(function.join(file), format!("{value}\n")).unwrap();
         }
         if let Some(vpd) = vpd {
@@ -268,20 +264,6 @@ pub(crate) mod testfs {
         let vfio_dev = sysfs.vfio_dev(&format!("vfio{n}"));
         fs::create_dir_all(&vfio_dev).unwrap();
         std::os::unix::fs::symlink(&function, vfio_dev.join("device")).unwrap();
-    }
-
-    /// One PF of a B200/B300 management ConnectX-7 (15b3:1021, InfiniBand
-    /// controller).  Only some PFs on the slot carry the marker.
-    pub fn add_management_pf(root: &Path, n: u32, bdf: &str, marker: bool) {
-        add_function(
-            root,
-            n,
-            bdf,
-            "0x15b3",
-            "0x1021",
-            "0x020700",
-            marker.then_some(SW_MNG_VPD),
-        );
     }
 }
 
@@ -383,19 +365,12 @@ mod tests {
         // The management ConnectX: the two limited PFs carry the marker, the
         // two full-capability siblings do not, and all four belong.
         for (n, function, marker) in [(1, 0, true), (2, 1, true), (3, 2, false), (4, 3, false)] {
-            testfs::add_management_pf(r, n, &format!("0000:05:00.{function}"), marker);
+            let vpd = marker.then_some(testfs::SW_MNG_VPD);
+            testfs::add_connectx(r, n, &format!("0000:05:00.{function}"), vpd);
         }
         // A data-path ConnectX on another slot: same vendor and class, a VPD
         // of its own, no role.  It must not be advertised anywhere.
-        testfs::add_function(
-            r,
-            5,
-            "0000:18:00.0",
-            "0x15b3",
-            "0x1021",
-            "0x020700",
-            Some(testfs::NIC_VPD),
-        );
+        testfs::add_connectx(r, 5, "0000:18:00.0", Some(testfs::NIC_VPD));
         // An H100-style NVSwitch bridge lands in the same resource.
         testfs::add_nvswitch(r, 6);
 
@@ -414,8 +389,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         testfs::add_gpu(r, 0);
-        testfs::add_management_pf(r, 1, "0000:05:00.0", true);
-        testfs::add_function(r, 2, "0000:05:00.1", "0x15b3", "0x1021", "0x020700", None);
+        testfs::add_connectx(r, 1, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
+        testfs::add_connectx(r, 2, "0000:05:00.1", None);
         let vpd = Sysfs::new(r).device("0000:05:00.1").unwrap().join("vpd");
         std::fs::create_dir(vpd).unwrap();
 
@@ -431,7 +406,7 @@ mod tests {
         // tied to the slot and is not advertised.
         let root = TempDir::new().unwrap();
         let r = root.path();
-        testfs::add_management_pf(r, 0, "0000:05:00.0", true);
+        testfs::add_connectx(r, 0, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
         testfs::add(r, 1, "0x15b3", "0x1021", "0x020700");
 
         let map = discover(r, &Sysfs::new(r), Naming::Alias);
@@ -442,7 +417,7 @@ mod tests {
     fn sku_mode_names_management_pfs_from_pci_ids() {
         let root = TempDir::new().unwrap();
         let r = root.path();
-        testfs::add_management_pf(r, 0, "0000:05:00.0", true);
+        testfs::add_connectx(r, 0, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
 
         let map = discover(r, &Sysfs::new(r), Naming::Sku);
         let name = map.keys().next().unwrap();
