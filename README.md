@@ -25,9 +25,15 @@ Fabric Manager is given ([HGX Shared NVSwitch guide][hgx-guide], sections
 data-path ConnectX NICs, so the third row is gated on the role pcilibs-rs
 reads from PCI VPD: every PF on a slot where one PF carries the exact
 `SMDL=SW_MNG` field. The scan runs only while such a cdev is bound, and an
-unreadable VPD advertises no management PF until the next poll. The name is
-the same on both platforms, so a Service VM pod requests
-`nvidia.com/nvswitch` everywhere and only the count differs.
+unreadable VPD advertises no management PF until the next poll.
+
+An advertised device is a PCI device, not a PCI function. The management
+ConnectX's PFs are therefore one `nvidia.com/nvswitch` device whose CDI
+entry carries one device node per function, so a Service VM requests
+`nvidia.com/nvswitch: 1` on B200/B300 and `nvidia.com/nvswitch: 4` on
+H100/H200, where each NVSwitch is its own PCI device. A partial passthrough
+of the management PFs cannot be expressed, and the count does not depend on
+whether the firmware exposes the limited-capability PFs.
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
 lists those rows for tools that need the resource names and PCI matches: one
@@ -47,7 +53,8 @@ aggregates or partitions what the node declares.
 
 For each present resource the plugin:
 
-1. writes a host CDI spec mapping device indices to IOMMUFD cdev paths —
+1. writes a host CDI spec mapping device indices to the IOMMUFD cdev paths
+   of each PCI device, one node per bound function —
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,
