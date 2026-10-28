@@ -14,31 +14,33 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 | Resource | PCI identity |
 | --- | --- |
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
-| `nvidia.com/nvswitch` | `0x10de`, class `0x0680xx` (bridge: other) |
-| `nvidia.com/nvswitch` | `0x15b3`, class `0x0207xx` (InfiniBand controller), NVSwitch management PFs only |
+| `nvidia.com/nvswitch-fabric` | `0x10de`, class `0x0680xx` (bridge: other), the NVSwitch chips |
+| `nvidia.com/nvswitch-fabric` | `0x15b3`, class `0x0207xx` (InfiniBand controller), NVSwitch management PFs only |
 
 On HGX H100/H200 the NVSwitches are PCI bridge functions. On HGX B200/B300
 they sit behind a management ConnectX and are represented by its PFs, two or
-four depending on firmware, and those PFs are what a Service VM running
-Fabric Manager is given ([HGX Shared NVSwitch guide][hgx-guide], sections
-2.5.2.2 and 3.2.2). Vendor and class cannot tell them from the node's
-data-path ConnectX NICs, so the third row is gated on the role pcilibs-rs
-reads from PCI VPD: every PF on a slot where one PF carries the exact
-`SMDL=SW_MNG` field. The scan runs only while such a cdev is bound, and an
-unreadable VPD advertises no management PF until the next poll.
+four depending on firmware ([HGX Shared NVSwitch guide][hgx-guide], sections
+2.5.2.2 and 3.2.2). Vendor and class cannot tell those PFs from the node's
+data-path ConnectX NICs, so that row is gated on the role pcilibs-rs reads
+from PCI VPD: every PF on a slot where one PF carries the exact
+`SMDL=SW_MNG` field.
 
-An advertised device is a PCI device, not a PCI function. The management
-ConnectX's PFs are therefore one `nvidia.com/nvswitch` device whose CDI
-entry carries one device node per function, so a Service VM requests
-`nvidia.com/nvswitch: 1` on B200/B300 and `nvidia.com/nvswitch: 4` on
-H100/H200, where each NVSwitch is its own PCI device. A partial passthrough
-of the management PFs cannot be expressed, and the count does not depend on
-whether the firmware exposes the limited-capability PFs.
+The fabric is one device on every platform. A Service VM running Fabric
+Manager takes all of the node's switch functions or none, so
+`nvidia.com/nvswitch-fabric` is advertised as a single device holding every
+one of them, with one CDI device node per function, and only once every
+switch function pcilibs-rs finds on the node is VFIO-bound. A Service VM
+requests `nvidia.com/nvswitch-fabric: 1` on H100/H200 and B200/B300 alike; a
+partial fabric cannot be requested, and the count depends neither on the
+platform nor on whether the firmware exposes the limited-capability PFs. The
+scan behind both rows runs only while a switch function is bound, and an
+unreadable VPD advertises no fabric until the next poll. GPUs stay one device
+per PCI device.
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
 lists those rows for tools that need the resource names and PCI matches: one
-entry per PCI identity with its `nvswitchManagement` gate, so a name appears
-once per row and `nvidia.com/nvswitch` twice.
+entry per PCI identity with its `unit` and `nvswitchManagement` gate, so
+`nvidia.com/nvswitch-fabric` appears twice.
 
 [hgx-guide]: https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf
 
@@ -54,7 +56,7 @@ aggregates or partitions what the node declares.
 For each present resource the plugin:
 
 1. writes a host CDI spec mapping device indices to the IOMMUFD cdev paths
-   of each PCI device, one node per bound function —
+   of each device, one node per bound function —
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,

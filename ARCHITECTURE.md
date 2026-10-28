@@ -2,7 +2,7 @@
 
 ## What this plugin does and does not do
 
-This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` (and `nvidia.com/nvswitch` where NVSwitch devices are bound, or the management ConnectX PFs that represent them on HGX B200/B300). It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
+This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` (and `nvidia.com/nvswitch-fabric` where the node's NVSwitch fabric is bound: the switch chips on HGX H100/H200, the management ConnectX PFs that represent them on HGX B200/B300). It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
 
 A clash with another plugin advertising `nvidia.com/gpu` is intentional and detects misconfiguration: trusted and untrusted workloads do not share a cluster, so on a Kata/untrusted cluster nothing else exposes this resource.
 
@@ -16,7 +16,7 @@ GPUs (and NVSwitches, where the platform has them) are passed through to Kata VM
 
 ## Service VM
 
-NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests every `nvidia.com/nvswitch` device the node advertises. On HGX H100/H200 those are four devices, one per NVSwitch chip. On HGX B200/B300 the NVSwitches are reached through a management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together, so the plugin advertises that ConnectX as one device under the same name, with every PF in its CDI entry. Telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads; the plugin stays a sysfs reader and binds nothing. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image serves both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
+NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests `nvidia.com/nvswitch-fabric: 1`, the same on every platform. On HGX H100/H200 that one device holds the four NVSwitch chips. On HGX B200/B300 it holds the management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together; telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads, and the plugin stays a sysfs reader and binds nothing. The fabric is advertised only once every switch function on the node is bound, so a Service VM never starts with part of one. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image and one pod spec serve both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
 
 ## Out of scope: multi-node NVLink (IMEX)
 
@@ -52,7 +52,7 @@ Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consump
 
 The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
 
-The unit of advertisement is the PCI device, not the PCI function. A multi-function device such as the B200/B300 management ConnectX is one device whose CDI entry carries every function, because no consumer can take a function without its siblings; that is identity, not aggregation. Grouping several PCI devices, such as the four H100 NVSwitch chips, would be an aggregate and stays out.
+The unit of advertisement is the smallest thing a consumer can take. For GPUs that is the PCI device: a multi-function device is one device whose CDI entry carries every function, because no consumer can take a function without its siblings. The NVSwitch fabric goes one step further and is one device per node, spanning the four switch chips on H100/H200 or the management ConnectX's PFs on B200/B300, because it has exactly one consumer, the Service VM, and exactly one valid shape, all of it. A subset of a fabric is never a consumption choice the layer above could make, which is what separates it from GPUs, whose shapes are many; grouping devices that have more than one valid consumption shape stays out.
 
 ### Why the plugin does not bind VFIO devices
 
@@ -64,7 +64,7 @@ The isolation primitive for untrusted workloads is the VM or CVM boundary, not p
 
 ## Cluster shape
 
-This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices. NVLink fabric configuration runs in the Service VM, a Kata pod in the workload cluster that holds the node's `nvidia.com/nvswitch` devices.
+This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices. NVLink fabric configuration runs in the Service VM, a Kata pod in the workload cluster that holds the node's `nvidia.com/nvswitch-fabric` device.
 
 ```text
 Admin cluster                        Workload cluster
@@ -72,5 +72,5 @@ Admin cluster                        Workload cluster
 GPU Operator (driver, MIG, fabric)   kata-device-plugin (declares only)
 VFIO binder                          Kata VMs
                                      Workload pods requesting nvidia.com/gpu
-                                     Service VM pod requesting nvidia.com/nvswitch
+                                     Service VM pod requesting nvidia.com/nvswitch-fabric
 ```
