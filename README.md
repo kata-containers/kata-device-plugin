@@ -30,8 +30,9 @@ the same on both platforms, so a Service VM pod requests
 `nvidia.com/nvswitch` everywhere and only the count differs.
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
-lists those rows, with the `nvswitchManagement` gate, for tools that need
-the resource names and PCI matches.
+lists those rows for tools that need the resource names and PCI matches: one
+entry per PCI identity with its `nvswitchManagement` gate, so a name appears
+once per row and `nvidia.com/nvswitch` twice.
 
 [hgx-guide]: https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf
 
