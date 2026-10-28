@@ -79,7 +79,7 @@ impl DeviceServer {
 
     /// This server's devices under the current scan: the discover() group
     /// matching our resolved name.
-    fn my_devices(&self) -> Vec<vfio::IommufdDev> {
+    fn my_devices(&self) -> Vec<vfio::Device> {
         vfio::discover(&self.device_dir, &self.sysfs, self.naming)
             .remove(&self.name)
             .unwrap_or_default()
@@ -190,7 +190,7 @@ impl DeviceServer {
     /// scan, or remove it when no devices remain.  Sync fs work runs off the
     /// async workers.  Callers decide the failure policy: the poller retries
     /// on the next tick, Allocate fails the RPC.
-    async fn sync_cdi_spec(&self, devs: &[vfio::IommufdDev]) -> anyhow::Result<()> {
+    async fn sync_cdi_spec(&self, devs: &[vfio::Device]) -> anyhow::Result<()> {
         if devs.is_empty() {
             let cdi_file = cdi::spec_path(&self.cdi_dir, &self.name);
             match tokio::fs::remove_file(&cdi_file).await {
@@ -273,8 +273,8 @@ impl DevicePlugin for DeviceServer {
             // must retry next tick without re-sending an identical device
             // list every 5s (kubelet churn); a device change must reach the
             // kubelet even while the CDI registry is briefly unwritable.
-            let mut sent: Option<Vec<u32>> = None;
-            let mut synced: Option<Vec<u32>> = None;
+            let mut sent: Option<Vec<Vec<u32>>> = None;
+            let mut synced: Option<Vec<Vec<u32>>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
                 // set never changes again — otherwise this task would poll
@@ -284,11 +284,15 @@ impl DevicePlugin for DeviceServer {
                 }
 
                 let vfio_devs = server.my_devices();
-                // Compare the backing cdev numbers, not the advertised Device
-                // list: IDs are just indices 0..n, so a same-count swap
-                // (vfio7 gone, vfio9 new) would look identical to the kubelet
-                // while the CDI spec's index → cdev mapping went stale.
-                let nums: Vec<u32> = vfio_devs.iter().map(|d| d.num).collect();
+                // Compare the backing cdev numbers per device, not the
+                // advertised Device list: IDs are just indices 0..n, so a
+                // same-count swap (vfio7 gone, vfio9 new) would look identical
+                // to the kubelet while the CDI spec's index → cdev mapping
+                // went stale.
+                let nums: Vec<Vec<u32>> = vfio_devs
+                    .iter()
+                    .map(|device| device.iter().map(|cdev| cdev.num).collect())
+                    .collect();
 
                 if Some(&nums) != synced.as_ref() {
                     match server.sync_cdi_spec(&vfio_devs).await {
