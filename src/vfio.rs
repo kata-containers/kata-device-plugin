@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -113,13 +114,16 @@ pub fn discover(
     naming: Naming,
 ) -> BTreeMap<String, Vec<IommufdDev>> {
     let mut map: BTreeMap<String, Vec<IommufdDev>> = BTreeMap::new();
-    // Resolved on first use and shared across the pass: the scan reads every
-    // Mellanox PF's VPD, so a node with no gated candidate never pays for it.
-    let mut management: Option<Vec<String>> = None;
+    // The topology scan reads every Mellanox PF's VPD, so it runs at most
+    // once per pass, and not at all unless a gated row has a candidate.
+    let management: OnceCell<Vec<String>> = OnceCell::new();
     for dev in pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs) {
         let Some(row) = RESOURCES.iter().find(|r| {
             r.matches(&dev)
-                && (!r.nvswitch_management || is_nvswitch_management(sysfs, &dev, &mut management))
+                && (!r.nvswitch_management
+                    || management
+                        .get_or_init(|| management_pfs(sysfs))
+                        .contains(&dev.bdf))
         }) else {
             continue;
         };
@@ -132,17 +136,12 @@ pub fn discover(
     map
 }
 
-/// Whether `dev` sits on one of the node's NVSwitch management PFs.  The
-/// topology scan fails closed: an unreadable or malformed VPD advertises no
-/// management PF this tick and the poller retries next tick.  NVRC applies
-/// the same policy inside the Service VM, so both ends agree that unsure
-/// means not a switch.
-fn is_nvswitch_management(
-    sysfs: &Sysfs,
-    dev: &IommufdDev,
-    cache: &mut Option<Vec<String>>,
-) -> bool {
-    let bdfs = cache.get_or_insert_with(|| match pcilibs_rs::platform::discover_topology(sysfs) {
+/// BDFs of the node's NVSwitch management PFs.  The scan fails closed: an
+/// unreadable or malformed VPD advertises no management PF this tick and the
+/// poller retries next tick.  NVRC applies the same policy inside the
+/// Service VM, so both ends agree that unsure means not a switch.
+fn management_pfs(sysfs: &Sysfs) -> Vec<String> {
+    match pcilibs_rs::platform::discover_topology(sysfs) {
         Ok(topology) => topology
             .management_functions
             .into_iter()
@@ -152,17 +151,7 @@ fn is_nvswitch_management(
             tracing::warn!("NVSwitch management PF scan failed, advertising none: {e}");
             Vec::new()
         }
-    });
-    bdf(sysfs, dev).is_some_and(|b| bdfs.contains(&b))
-}
-
-/// The PCI function behind a cdev: the kernel links
-/// `/sys/class/vfio-dev/vfioN/device` to it, and the link target's name is
-/// the canonical BDF.
-fn bdf(sysfs: &Sysfs, dev: &IommufdDev) -> Option<String> {
-    let link =
-        std::fs::read_link(sysfs.vfio_dev(&format!("vfio{}", dev.num)).join("device")).ok()?;
-    pcilibs_rs::normalize_bdf(link.file_name()?.to_str()?)
+    }
 }
 
 /// 10de:2330 → "nvidia.com/GH100_H100_SXM5_80GB"; ids the PCI database does
@@ -217,11 +206,9 @@ fn sanitize(raw: &str) -> String {
 /// NVIDIA-flavoured wrappers over pcilibs-rs's `testfs` fixtures.
 #[cfg(test)]
 pub(crate) mod testfs {
-    use std::fs;
     use std::path::Path;
 
-    pub use pcilibs_rs::testfs::add;
-    use pcilibs_rs::Sysfs;
+    pub use pcilibs_rs::testfs::{add, add_connectx};
 
     /// An H100 SXM5 80GB: pci-ids 10de:2330, so SKU naming is exercised
     /// against the real database.
@@ -231,39 +218,6 @@ pub(crate) mod testfs {
 
     pub fn add_nvswitch(root: &Path, n: u32) {
         add(root, n, "0x10de", "0x22a3", "0x068000");
-    }
-
-    /// VPD with the exact vendor field the HGX guide documents for the
-    /// management ConnectX: one read-only resource, keyword VA, end tag.
-    pub const SW_MNG_VPD: &[u8] = b"\x90\x0e\x00VA\x0bSMDL=SW_MNG\x78";
-
-    /// The same vendor field on a data-path ConnectX: a VPD, no role.
-    pub const NIC_VPD: &[u8] = b"\x90\x0e\x00VA\x0bMLX:MN=MLNX\x78";
-
-    /// A ConnectX-7 InfiniBand PF cdev (15b3:1021) laid out the way the
-    /// kernel does it: the function under `bus/pci/devices/<bdf>` with its
-    /// identity files and optional VPD, and the vfio-dev `device` entry a
-    /// symlink to it, which is what BDF resolution and the VPD scan read.
-    pub fn add_connectx(root: &Path, n: u32, bdf: &str, vpd: Option<&[u8]>) {
-        let sysfs = Sysfs::new(root);
-        let function = sysfs.device(bdf).unwrap();
-        fs::create_dir_all(&function).unwrap();
-        for (file, value) in [
-            ("vendor", "0x15b3"),
-            ("device", "0x1021"),
-            ("class", "0x020700"),
-        ] {
-            fs::write(function.join(file), format!("{value}\n")).unwrap();
-        }
-        if let Some(vpd) = vpd {
-            fs::write(function.join("vpd"), vpd).unwrap();
-        }
-        let devices = root.join("devices");
-        fs::create_dir_all(&devices).unwrap();
-        fs::write(devices.join(format!("vfio{n}")), b"").unwrap();
-        let vfio_dev = sysfs.vfio_dev(&format!("vfio{n}"));
-        fs::create_dir_all(&vfio_dev).unwrap();
-        std::os::unix::fs::symlink(&function, vfio_dev.join("device")).unwrap();
     }
 }
 
@@ -344,6 +298,7 @@ mod tests {
         let dev_h100 = IommufdDev {
             num: 0,
             path: "/dev/vfio/devices/vfio0".into(),
+            bdf: "0000:01:00.0".to_owned(),
             vendor: 0x10de,
             device: 0x2330,
             class: 0x030200,
@@ -365,12 +320,11 @@ mod tests {
         // The management ConnectX: the two limited PFs carry the marker, the
         // two full-capability siblings do not, and all four belong.
         for (n, function, marker) in [(1, 0, true), (2, 1, true), (3, 2, false), (4, 3, false)] {
-            let vpd = marker.then_some(testfs::SW_MNG_VPD);
-            testfs::add_connectx(r, n, &format!("0000:05:00.{function}"), vpd);
+            testfs::add_connectx(r, n, &format!("0000:05:00.{function}"), marker);
         }
-        // A data-path ConnectX on another slot: same vendor and class, a VPD
-        // of its own, no role.  It must not be advertised anywhere.
-        testfs::add_connectx(r, 5, "0000:18:00.0", Some(testfs::NIC_VPD));
+        // A data-path ConnectX on another slot: same vendor and class, no
+        // role.  It must not be advertised anywhere.
+        testfs::add_connectx(r, 5, "0000:18:00.0", false);
         // An H100-style NVSwitch bridge lands in the same resource.
         testfs::add_nvswitch(r, 6);
 
@@ -389,8 +343,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         testfs::add_gpu(r, 0);
-        testfs::add_connectx(r, 1, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
-        testfs::add_connectx(r, 2, "0000:05:00.1", None);
+        testfs::add_connectx(r, 1, "0000:05:00.0", true);
+        testfs::add_connectx(r, 2, "0000:05:00.1", false);
         let vpd = Sysfs::new(r).device("0000:05:00.1").unwrap().join("vpd");
         std::fs::create_dir(vpd).unwrap();
 
@@ -400,24 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn cdev_without_a_pci_function_link_is_not_management() {
-        // The marker slot is there and readable, but this cdev's vfio-dev
-        // entry has no `device` link to resolve a BDF from, so it cannot be
-        // tied to the slot and is not advertised.
-        let root = TempDir::new().unwrap();
-        let r = root.path();
-        testfs::add_connectx(r, 0, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
-        testfs::add(r, 1, "0x15b3", "0x1021", "0x020700");
-
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
-        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![0]);
-    }
-
-    #[test]
     fn sku_mode_names_management_pfs_from_pci_ids() {
         let root = TempDir::new().unwrap();
         let r = root.path();
-        testfs::add_connectx(r, 0, "0000:05:00.0", Some(testfs::SW_MNG_VPD));
+        testfs::add_connectx(r, 0, "0000:05:00.0", true);
 
         let map = discover(r, &Sysfs::new(r), Naming::Sku);
         let name = map.keys().next().unwrap();
