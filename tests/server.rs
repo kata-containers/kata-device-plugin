@@ -15,7 +15,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use pcilibs_rs::testfs::add as add_dev;
+use pcilibs_rs::testfs::{add as add_dev, add_connectx};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -481,28 +481,6 @@ fn remove_dev(root: &std::path::Path, n: u32) {
     std::fs::remove_dir_all(Sysfs::new(root).vfio_dev(&format!("vfio{n}"))).unwrap();
 }
 
-/// A ConnectX-7 InfiniBand PF cdev laid out the way the kernel does it: the
-/// function under `bus/pci/devices/<bdf>` with identity files and VPD, and
-/// the vfio-dev `device` entry a symlink to it, which is what the plugin's
-/// BDF resolution and pcilibs-rs's VPD scan read.
-fn add_connectx(root: &std::path::Path, n: u32, bdf: &str, vpd: &[u8]) {
-    let sysfs = Sysfs::new(root);
-    let function = sysfs.device(bdf).unwrap();
-    std::fs::create_dir_all(&function).unwrap();
-    for (file, value) in [
-        ("vendor", "0x15b3"),
-        ("device", "0x1021"),
-        ("class", "0x020700"),
-    ] {
-        std::fs::write(function.join(file), format!("{value}\n")).unwrap();
-    }
-    std::fs::write(function.join("vpd"), vpd).unwrap();
-    std::fs::write(root.join("devices").join(format!("vfio{n}")), b"").unwrap();
-    let vfio_dev = sysfs.vfio_dev(&format!("vfio{n}"));
-    std::fs::create_dir_all(&vfio_dev).unwrap();
-    std::os::unix::fs::symlink(&function, vfio_dev.join("device")).unwrap();
-}
-
 #[tokio::test(start_paused = true)]
 async fn same_count_device_swap_refreshes_cdi_spec() {
     // vfio0 is replaced by vfio5 between polls.  The advertised Device list
@@ -791,14 +769,16 @@ async fn nvswitch_management_pfs_are_served_as_nvswitch() {
     // carry the VPD marker, all four belong.  A data-path ConnectX of the
     // same vendor and class, VFIO-bound for some other purpose, must not be
     // advertised.
-    const SW_MNG: &[u8] = b"\x90\x0e\x00VA\x0bSMDL=SW_MNG\x78";
-    const NO_ROLE: &[u8] = b"\x90\x0e\x00VA\x0bMLX:MN=MLNX\x78";
     let vfio = fake_vfio(2);
     for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
-        let vpd = if function < 2 { SW_MNG } else { NO_ROLE };
-        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), vpd);
+        add_connectx(
+            vfio.path(),
+            n,
+            &format!("0000:05:00.{function}"),
+            function < 2,
+        );
     }
-    add_connectx(vfio.path(), 6, "0000:18:00.0", NO_ROLE);
+    add_connectx(vfio.path(), 6, "0000:18:00.0", false);
 
     let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
 
