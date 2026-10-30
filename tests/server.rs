@@ -62,7 +62,7 @@ fn fake_vfio(n: u32) -> TempDir {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("devices")).unwrap();
     for i in 0..n {
-        add_dev(dir.path(), i, "0x10de", "0x2330", "0x030200");
+        add_dev(dir.path(), i, 0x10de, 0x2330, 0x030200);
     }
     dir
 }
@@ -256,13 +256,7 @@ async fn recovers_from_repeated_kubelet_restarts() -> anyhow::Result<()> {
         // Kubelet unlinks plugin endpoints on startup. Keep the old stream
         // open to ensure endpoint recreation does not wait for it to drain.
         node.stop_kubelet(true).await?;
-        add_dev(
-            node._vfio.path(),
-            restart + 2,
-            "0x10de",
-            "0x2330",
-            "0x030200",
-        );
+        add_dev(node._vfio.path(), restart + 2, 0x10de, 0x2330, 0x030200);
         if restart == 0 {
             tokio::time::sleep(Duration::from_secs(6)).await;
             assert!(node.sockets.path().join("kata-gpu.sock").exists());
@@ -457,7 +451,7 @@ async fn devices_appearing_after_startup_are_published() {
     assert_eq!(first.devices.len(), 0, "must start with zero devices");
 
     // Simulate the VFIO cdev appearing after the DP is already running.
-    add_dev(node._vfio.path(), 0, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 0, 0x10de, 0x2330, 0x030200);
 
     // The poller ticks every POLL_INTERVAL (5 s).  Time is paused
     // (start_paused), so the tick auto-advances as soon as the runtime idles;
@@ -498,7 +492,7 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
         .contains("vfio0"));
 
     remove_dev(node._vfio.path(), 0);
-    add_dev(node._vfio.path(), 5, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 5, 0x10de, 0x2330, 0x030200);
 
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
         .await
@@ -573,7 +567,7 @@ async fn cdi_write_failure_is_retried_next_tick() {
     let spec_path = node.cdi.path().join("kata.nvidia.com-gpu.yaml");
     std::fs::remove_file(&spec_path).unwrap();
     std::fs::create_dir(&spec_path).unwrap();
-    add_dev(node._vfio.path(), 1, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 1, 0x10de, 0x2330, 0x030200);
 
     // The device update must reach the kubelet even while the CDI write fails.
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
@@ -738,12 +732,12 @@ async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
     // advertised anywhere.
     let vfio = TempDir::new().unwrap();
     for i in 0..2 {
-        add_dev(vfio.path(), i, "0x10de", "0x2330", "0x030200");
+        add_dev(vfio.path(), i, 0x10de, 0x2330, 0x030200);
     }
     for i in 2..5 {
-        add_dev(vfio.path(), i, "0x10de", "0x22a3", "0x068000");
+        add_dev(vfio.path(), i, 0x10de, 0x22a3, 0x068000);
     }
-    add_dev(vfio.path(), 5, "0x15b3", "0x101e", "0x020000");
+    add_dev(vfio.path(), 5, 0x15b3, 0x101e, 0x020000);
 
     let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
 
