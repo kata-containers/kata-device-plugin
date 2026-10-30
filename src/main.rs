@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             Path::new(vfio::VFIO_DIR),
             &vfio::Sysfs::new(Path::new(vfio::SYSFS_ROOT)),
             naming,
+            view.current().as_ref(),
         )
         .into_keys()
         .collect();

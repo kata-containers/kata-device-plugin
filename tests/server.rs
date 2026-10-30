@@ -16,9 +16,11 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use kata_device_plugin::view::{View, GRACE};
+use kata_device_plugin::view::{self, View, GRACE};
+use pcilibs_rs::fabric::grpc::FabricViewServiceClient;
+use pcilibs_rs::fabric::v1::{self, FabricView};
 use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
-use pcilibs_rs::testfs::{add as add_dev, add_connectx};
+use pcilibs_rs::testfs::{add as add_dev, add_at, add_connectx};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -86,6 +88,97 @@ async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<Channel> {
     DevicePluginClient::new(channel)
 }
 
+/// A view and the pieces that keep it current: the service it was published
+/// through and the publisher's still-open stream.
+struct Published {
+    view: Arc<View>,
+    _tx: tokio::sync::mpsc::Sender<FabricView>,
+    stop: CancellationToken,
+    _state: TempDir,
+}
+
+/// Publish `fabric_view` the way fmclient does, over the host socket, and
+/// keep the stream open so the view stays current.
+async fn published(fabric_view: FabricView) -> Published {
+    let state = TempDir::new().unwrap();
+    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let socket = state.path().join("fabric-view.sock");
+    let unix = UnixListener::bind(&socket).unwrap();
+    let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let stop = CancellationToken::new();
+    tokio::spawn(view::serve(view.clone(), unix, tcp, stop.clone()));
+    let channel = Endpoint::try_from("http://[::]:0")
+        .unwrap()
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<FabricView>(2);
+    let mut client = FabricViewServiceClient::new(channel);
+    tokio::spawn(async move {
+        client
+            .publish(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )))
+            .await
+    });
+    tx.send(fabric_view).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while view.current().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the published view did not become current");
+    Published {
+        view,
+        _tx: tx,
+        stop,
+        _state: state,
+    }
+}
+
+/// A view: unit word and `(id, active, member physical ids)` partitions.
+fn fabric_view(unit: &str, partitions: &[(u32, bool, &[u32])]) -> FabricView {
+    FabricView {
+        partitions: Some(v1::PartitionList {
+            version: 1,
+            max_num_partitions: 15,
+            partition_info: partitions
+                .iter()
+                .map(|&(id, active, members)| v1::Partition {
+                    partition_id: id,
+                    is_active: active,
+                    gpu_info: members
+                        .iter()
+                        .map(|&physical_id| v1::PartitionGpu {
+                            physical_id,
+                            ..Default::default()
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }),
+        unsupported: None,
+        unit: unit.to_owned(),
+    }
+}
+
+/// A GPU as cdev `n` at `address`, labeled with module slot `module` the way
+/// DGX firmware does.
+fn add_labeled_gpu(root: &std::path::Path, n: u32, address: &str, module: u8) {
+    let function = add_at(root, n, address, 0x10de, 0x2330, 0x030200);
+    std::fs::write(function.join("label"), format!("GPU{n}, SMX{module}\n")).unwrap();
+}
+
 /// Mock kubelet plus one running DeviceServer per resource name.
 struct Node {
     // Keeps the fake /dev/vfio alive for the servers' lifetime.
@@ -104,6 +197,17 @@ impl Node {
     }
 
     async fn start_with(vfio: TempDir, resources: &[&str], naming: Naming) -> Node {
+        Self::start_with_view(vfio, resources, naming, None).await
+    }
+
+    /// With a view, the servers advertise GPUs as the view says; without
+    /// one, a bound fabric withholds them.
+    async fn start_with_view(
+        vfio: TempDir,
+        resources: &[&str],
+        naming: Naming,
+        view: Option<Arc<View>>,
+    ) -> Node {
         let sockets = TempDir::new().unwrap();
         let cdi = TempDir::new().unwrap();
         let registered = Arc::new(Mutex::new(None));
@@ -125,7 +229,7 @@ impl Node {
         let servers = resources
             .iter()
             .map(|name| {
-                let server = DeviceServer::new(
+                let mut server = DeviceServer::new(
                     name,
                     naming,
                     vfio.path().to_str().unwrap(),
@@ -133,6 +237,9 @@ impl Node {
                     sockets.path().to_str().unwrap(),
                     cdi.path().to_str().unwrap(),
                 );
+                if let Some(view) = &view {
+                    server = server.with_view(view.clone(), None);
+                }
                 let tok = token.clone();
                 tokio::spawn(async move {
                     server.run(tok).await.ok();
@@ -679,11 +786,15 @@ async fn sku_mode_serves_under_the_sku_name() {
     // End to end under a SKU-resolved name: socket, registration, CDI spec
     // file, and device IDs must all follow the resolved name, not the row.
     let vfio = fake_vfio(2);
-    let name =
-        kata_device_plugin::vfio::discover(vfio.path(), &Sysfs::new(vfio.path()), Naming::Sku)
-            .into_keys()
-            .next()
-            .expect("two H100 cdevs resolve to one SKU name");
+    let name = kata_device_plugin::vfio::discover(
+        vfio.path(),
+        &Sysfs::new(vfio.path()),
+        Naming::Sku,
+        None,
+    )
+    .into_keys()
+    .next()
+    .expect("two H100 cdevs resolve to one SKU name");
     assert!(name.starts_with("nvidia.com/GH100"), "{name}");
 
     let sock = format!("kata-{}.sock", name.rsplit('/').next().unwrap());
@@ -741,7 +852,16 @@ async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
     }
     add_dev(vfio.path(), 5, 0x15b3, 0x101e, 0x020000);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
+    // The fabric is bound, so GPUs appear only once the owner's view says
+    // how; unit gpu keeps them one device each.
+    let owner = published(fabric_view("gpu", &[])).await;
+    let node = Node::start_with_view(
+        vfio,
+        &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"],
+        Naming::Alias,
+        Some(owner.view.clone()),
+    )
+    .await;
 
     for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch-fabric.sock", 1)] {
         let (_stream, resp) = node.snapshot(sock).await;
@@ -758,6 +878,7 @@ async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
     assert!(!gpu.contains("devices/vfio5") && !sw.contains("devices/vfio5"));
 
     node.shutdown().await;
+    owner.stop.cancel();
 }
 
 #[tokio::test]
@@ -779,7 +900,14 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
     }
     add_connectx(vfio.path(), 6, "0000:18:00.0", false);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
+    let owner = published(fabric_view("gpu", &[])).await;
+    let node = Node::start_with_view(
+        vfio,
+        &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"],
+        Naming::Alias,
+        Some(owner.view.clone()),
+    )
+    .await;
 
     let (_gpu_stream, gpus) = node.snapshot("kata-gpu.sock").await;
     assert_eq!(gpus.devices.len(), 2);
@@ -822,6 +950,7 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
     );
 
     node.shutdown().await;
+    owner.stop.cancel();
 }
 
 /// A server on `name` over `vfio`, given the view, serving without a kubelet.
@@ -905,12 +1034,17 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     assert_ne!(again.envs[TOKEN_ENV], token);
     assert_eq!(again.envs[TOKEN_ENV], view.token());
 
-    // A GPU's holder learns nothing, with or without a node address.
-    let (gpu_stop, gpu) = server_with_view("nvidia.com/gpu", &vfio, &sockets, &view, None).await;
+    // A GPU's holder learns nothing, with or without a node address.  The
+    // fabric is bound, so the GPU exists only under a view: a second View
+    // instance over the same state publishes unit gpu for it.
+    let owner = published(fabric_view("gpu", &[])).await;
+    let (gpu_stop, gpu) =
+        server_with_view("nvidia.com/gpu", &vfio, &sockets, &owner.view, None).await;
     let resp = allocate_first(sockets.path().join("kata-gpu.sock")).await;
     assert_eq!(resp.cdi_devices[0].name, "nvidia.com/gpu=0");
     assert!(resp.envs.is_empty());
     assert_eq!(view.token(), again.envs[TOKEN_ENV]);
+    owner.stop.cancel();
 
     // Without a node address the holder still gets the token.
     fabric_stop.cancel();
@@ -925,4 +1059,81 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
         stop.cancel();
         handle.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn active_partitions_are_served_as_nvlink_units() {
+    // Four labeled GPUs and a bound fabric, carved by the Service VM into two
+    // pairs: the kubelet sees two nvidia.com/nvlink-2gpu devices and no
+    // plain GPU, each unit's CDI entry carries both GPUs' functions, and
+    // Allocate names the unit.
+    let vfio = TempDir::new().unwrap();
+    for (n, address, module) in [
+        (0, "0000:1a:00.0", 7),
+        (1, "0000:3c:00.0", 6),
+        (2, "0000:62:00.0", 8),
+        (3, "0000:73:00.0", 5),
+    ] {
+        add_labeled_gpu(vfio.path(), n, address, module);
+    }
+    for n in 4..8u32 {
+        add_dev(vfio.path(), n, 0x10de, 0x22a3, 0x068000);
+    }
+    let pairs: &[(u32, bool, &[u32])] = &[(6, true, &[5, 6]), (7, true, &[7, 8])];
+    let owner = published(fabric_view("partition", pairs)).await;
+    let node = Node::start_with_view(
+        vfio,
+        &[
+            "nvidia.com/nvlink-2gpu",
+            "nvidia.com/gpu",
+            "nvidia.com/nvswitch-fabric",
+        ],
+        Naming::Alias,
+        Some(owner.view.clone()),
+    )
+    .await;
+
+    let (_units, units) = node.snapshot("kata-nvlink-2gpu.sock").await;
+    assert_eq!(units.devices.len(), 2);
+    let (_gpus, gpus) = node.snapshot("kata-gpu.sock").await;
+    assert!(gpus.devices.is_empty());
+    let (_fabric, fabric) = node.snapshot("kata-nvswitch-fabric.sock").await;
+    assert_eq!(fabric.devices.len(), 1);
+
+    let spec: Spec =
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvlink-2gpu.yaml").unwrap()).unwrap();
+    assert_eq!(spec.kind, "nvidia.com/nvlink-2gpu");
+    let cdevs = |i: usize| -> Vec<String> {
+        spec.devices[i]
+            .container_edits
+            .device_nodes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|node| node.path.rsplit('/').next().unwrap().to_owned())
+            .collect()
+    };
+    // Partition 6 is GPUs 5 and 6, partition 7 is 7 and 8, in FM's order.
+    assert_eq!(cdevs(0), ["vfio3", "vfio1"]);
+    assert_eq!(cdevs(1), ["vfio0", "vfio2"]);
+
+    let resp = node
+        .client("kata-nvlink-2gpu.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["1".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.container_responses[0].cdi_devices[0].name,
+        "nvidia.com/nvlink-2gpu=1"
+    );
+    assert!(resp.container_responses[0].envs.is_empty());
+
+    node.shutdown().await;
+    owner.stop.cancel();
 }
