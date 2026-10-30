@@ -20,7 +20,7 @@ container-device-interface = { git = "https://github.com/cncf-tags/container-dev
 # No crates.io release yet; pinned to the commit that carries NVLink fabric
 # discovery (management ConnectX PFs) and the PCI address of the function
 # behind a cdev, which the nvswitch row relies on.
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "67118e9", features = ["fabric-grpc"] }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "3994ae1", features = ["fabric-grpc"] }
 prost = "0.14"
 serde-saphyr = { version = "2", default-features = false, features = ["serialize"] }
 tokio = { version = "1", features = ["full"] }
@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "67118e9", features = ["fabric-grpc", "testfs"] }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "3994ae1", features = ["fabric-grpc", "testfs"] }
 serde_json = "1"
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 tempfile = "3"
