@@ -11,12 +11,14 @@
 //! stream to time out.  The open stream is the view's liveness: when it
 //! closes, the view is withdrawn after a grace period, long enough for the
 //! publisher's reconnect and short enough that a dead Service VM does not
-//! keep its partitions advertised.
+//! keep its partitions advertised.  A new fabric holder withdraws the view at
+//! once: the partitions it describes were the previous holder's.
 
 use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -48,18 +50,36 @@ pub const HOST_IP_ENV: &str = "KATA_DEVICE_PLUGIN_HOST_IP";
 /// inside it, a dead publisher is noticed before the kubelet's next look.
 pub const GRACE: Duration = Duration::from_secs(15);
 
-struct Stream {
+/// The publisher's stream, which is the view's liveness.
+enum Stream {
+    None,
+    Open,
+    Closed(Instant),
+}
+
+struct State {
+    token: String,
     current: Option<FabricView>,
+    /// Advanced by every new stream and every new fabric holder, so a
+    /// Publish call can tell that it has been superseded.
     generation: u64,
-    open: bool,
-    closed_at: Option<Instant>,
+    stream: Stream,
+}
+
+impl State {
+    fn alive(&self, grace: Duration) -> bool {
+        match self.stream {
+            Stream::Open => true,
+            Stream::Closed(at) => at.elapsed() < grace,
+            Stream::None => false,
+        }
+    }
 }
 
 /// The published view and the token that gates publishing, shared by the
 /// listeners, Allocate, and discover().
 pub struct View {
-    stream: Mutex<Stream>,
-    token: RwLock<String>,
+    state: Mutex<State>,
     token_path: PathBuf,
     grace: Duration,
 }
@@ -85,13 +105,12 @@ impl View {
             Err(e) => return Err(e).with_context(|| format!("read {}", token_path.display())),
         };
         Ok(Arc::new(Self {
-            stream: Mutex::new(Stream {
+            state: Mutex::new(State {
+                token,
                 current: None,
                 generation: 0,
-                open: false,
-                closed_at: None,
+                stream: Stream::None,
             }),
-            token: RwLock::new(token),
             token_path,
             grace,
         }))
@@ -99,63 +118,80 @@ impl View {
 
     /// The token a publisher must present on the TCP listener.
     pub fn token(&self) -> String {
-        self.token.read().unwrap().clone()
+        self.state.lock().unwrap().token.clone()
     }
 
-    /// A new fabric holder gets a new token, so the previous holder's copy
-    /// stops working the moment the fabric changes hands.
+    /// A new fabric holder gets a new token and the previous holder's stream
+    /// is superseded, so its copy stops working the moment the fabric changes
+    /// hands.  Its view goes too: the partitions were the previous holder's.
     pub fn rotate_token(&self) -> anyhow::Result<String> {
+        let mut state = self.state.lock().unwrap();
         let token = write_token(&self.token_path)?;
-        *self.token.write().unwrap() = token.clone();
+        state.token = token.clone();
+        state.generation += 1;
+        state.stream = Stream::None;
+        if state.current.take().is_some() {
+            info!("fabric view: withdrawn, the fabric has a new holder");
+        }
         Ok(token)
     }
 
     /// The view discover() may act on: the last one published, while its
     /// stream is open or closed less than the grace period ago.
     pub fn current(&self) -> Option<FabricView> {
-        let stream = self.stream.lock().unwrap();
-        let alive = stream.open
-            || stream
-                .closed_at
-                .is_some_and(|closed| closed.elapsed() < self.grace);
-        alive.then(|| stream.current.clone()).flatten()
+        let state = self.state.lock().unwrap();
+        state
+            .alive(self.grace)
+            .then(|| state.current.clone())
+            .flatten()
     }
 
     fn opened(&self) -> u64 {
-        let mut stream = self.stream.lock().unwrap();
-        stream.generation += 1;
-        stream.open = true;
-        stream.closed_at = None;
-        if stream.generation > 1 {
+        let mut state = self.state.lock().unwrap();
+        // A view past its grace period is gone; the new stream must not
+        // bring it back for the time until its first message arrives.
+        if !state.alive(self.grace) {
+            state.current = None;
+        }
+        if matches!(state.stream, Stream::Open) {
             info!("fabric view: a newer publisher replaces the current stream");
         }
-        stream.generation
+        state.generation += 1;
+        state.stream = Stream::Open;
+        state.generation
     }
 
     /// False when `generation` is no longer the current stream.
     fn received(&self, generation: u64, view: FabricView) -> bool {
-        let mut stream = self.stream.lock().unwrap();
-        if stream.generation != generation {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation {
             return false;
         }
-        if stream.current.as_ref() != Some(&view) {
-            info!("fabric view: {}", describe(&view));
+        if state.current.as_ref() != Some(&view) {
+            info!("fabric view: {view}");
         }
-        stream.current = Some(view);
+        state.current = Some(view);
         true
     }
 
     fn closed(&self, generation: u64) {
-        let mut stream = self.stream.lock().unwrap();
-        if stream.generation == generation {
-            stream.open = false;
-            stream.closed_at = Some(Instant::now());
+        let mut state = self.state.lock().unwrap();
+        if state.generation == generation {
+            state.stream = Stream::Closed(Instant::now());
             info!(
                 grace_secs = self.grace.as_secs(),
                 "fabric view: stream closed"
             );
         }
     }
+}
+
+/// The endpoint an in-band publisher reaches this node at, from the node
+/// address the chart passes in; `None` when that is not an IP address.
+pub fn endpoint(host_ip: &str) -> Option<String> {
+    let ip: IpAddr = host_ip.trim().parse().ok()?;
+    // SocketAddr brackets an IPv6 address, as a URL authority requires.
+    Some(format!("http://{}", SocketAddr::new(ip, PORT)))
 }
 
 fn is_token(s: &str) -> bool {
@@ -183,28 +219,11 @@ fn write_token(path: &Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
-/// One line for the log: the unit and the active partitions with their sizes.
-fn describe(view: &FabricView) -> String {
-    let active: Vec<String> = view
-        .partitions
-        .iter()
-        .flat_map(|list| list.partition_info.iter())
-        .filter(|p| p.is_active)
-        .map(|p| format!("{}x{}", p.partition_id, p.gpu_info.len()))
-        .collect();
-    format!(
-        "unit {:?}, active partitions (id x gpus): {}",
-        view.unit,
-        if active.is_empty() {
-            "none".to_owned()
-        } else {
-            active.join(" ")
-        }
-    )
-}
-
 /// The Publish stream's server end.
-struct Service(Arc<View>);
+struct Service {
+    view: Arc<View>,
+    shutdown: CancellationToken,
+}
 
 #[tonic::async_trait]
 impl FabricViewService for Service {
@@ -212,14 +231,24 @@ impl FabricViewService for Service {
         &self,
         request: Request<Streaming<FabricView>>,
     ) -> Result<Response<PublishSummary>, Status> {
-        let generation = self.0.opened();
+        let generation = self.view.opened();
         let mut stream = request.into_inner();
         let mut received = 0u32;
+        // Shutdown ends the stream from this side: the server's graceful
+        // shutdown waits for open streams, and this one never ends on its own.
         let outcome = loop {
-            match stream.message().await {
+            let message = tokio::select! {
+                message = stream.message() => message,
+                () = self.shutdown.cancelled() => {
+                    break Err(Status::unavailable("the plugin is shutting down"))
+                }
+            };
+            match message {
                 Ok(Some(view)) => {
-                    if !self.0.received(generation, view) {
-                        break Err(Status::aborted("replaced by a newer publisher"));
+                    if !self.view.received(generation, view) {
+                        break Err(Status::aborted(
+                            "superseded by a newer stream or a new fabric holder",
+                        ));
                     }
                     received += 1;
                 }
@@ -227,7 +256,7 @@ impl FabricViewService for Service {
                 Err(status) => break Err(status),
             }
         };
-        self.0.closed(generation);
+        self.view.closed(generation);
         outcome.map(|()| {
             Response::new(PublishSummary {
                 views_received: received,
@@ -249,9 +278,14 @@ pub async fn bind(socket: &Path) -> anyhow::Result<(UnixListener, TcpListener)> 
         Err(e) => return Err(e).with_context(|| format!("remove {}", socket.display())),
     }
     let unix = UnixListener::bind(socket).with_context(|| format!("bind {}", socket.display()))?;
-    let tcp = TcpListener::bind(("0.0.0.0", PORT))
-        .await
-        .with_context(|| format!("bind 0.0.0.0:{PORT}"))?;
+    // Linux binds the IPv6 wildcard dual-stack, so it takes IPv4 connections
+    // too; a pod without IPv6 cannot bind it and gets the IPv4 wildcard.
+    let tcp = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, PORT)).await {
+        Ok(tcp) => tcp,
+        Err(_) => TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT))
+            .await
+            .with_context(|| format!("bind port {PORT}"))?,
+    };
     Ok((unix, tcp))
 }
 
@@ -265,20 +299,37 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     info!(socket = %HOST_SOCKET, port = PORT, "fabric view service starting");
-    let host = Server::builder()
-        .add_service(FabricViewServiceServer::new(Service(view.clone())))
+    // Pings every third of the grace period, answered within another third:
+    // a publisher that dies without closing its stream is closed within two
+    // thirds of the grace period, and its view withdrawn one grace period
+    // after that.
+    let keepalive = view.grace / 3;
+    let server = || {
+        Server::builder()
+            .http2_keepalive_interval(Some(keepalive))
+            .http2_keepalive_timeout(Some(keepalive))
+    };
+    let service = || Service {
+        view: view.clone(),
+        shutdown: shutdown.clone(),
+    };
+    let host = server()
+        .add_service(FabricViewServiceServer::new(service()))
         .serve_with_incoming_shutdown(
             UnixListenerStream::new(unix),
             shutdown.clone().cancelled_owned(),
         );
     let gate = view.clone();
     let authenticated =
-        FabricViewServiceServer::with_interceptor(Service(view), move |request: Request<()>| {
+        FabricViewServiceServer::with_interceptor(service(), move |request: Request<()>| {
             require_token(&gate.token())(request)
         });
-    let pod = Server::builder()
+    let pod = server()
         .add_service(authenticated)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(tcp), shutdown.cancelled_owned());
+        .serve_with_incoming_shutdown(
+            TcpListenerStream::new(tcp),
+            shutdown.clone().cancelled_owned(),
+        );
     let (host, pod) = tokio::join!(host, pod);
     host.context("fabric view host socket")?;
     pod.context("fabric view port")?;
@@ -298,6 +349,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::transport::{Channel, Endpoint, Uri};
+    use tonic::Code;
     use tower::service_fn;
 
     fn view(unit: &str, active: &[u32]) -> FabricView {
@@ -324,6 +376,7 @@ mod tests {
         socket: PathBuf,
         port: u16,
         stop: CancellationToken,
+        served: tokio::task::JoinHandle<anyhow::Result<()>>,
         _dir: TempDir,
     }
 
@@ -335,12 +388,13 @@ mod tests {
         let tcp = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = tcp.local_addr().unwrap().port();
         let stop = CancellationToken::new();
-        tokio::spawn(serve(view.clone(), unix, tcp, stop.clone()));
+        let served = tokio::spawn(serve(view.clone(), unix, tcp, stop.clone()));
         Node {
             view,
             socket,
             port,
             stop,
+            served,
             _dir: dir,
         }
     }
@@ -395,6 +449,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    /// Poll `view` until `pred` holds, within two seconds.
+    async fn until(view: &View, pred: impl Fn(Option<FabricView>) -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pred(view.current()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the view did not reach the expected state");
+    }
+
     #[test]
     fn token_is_minted_once_and_rotated_on_demand() {
         let dir = TempDir::new().unwrap();
@@ -436,6 +501,20 @@ mod tests {
         assert!(View::load(&file.join("state")).is_err());
     }
 
+    #[test]
+    fn the_endpoint_is_a_url_for_either_address_family() {
+        assert_eq!(
+            endpoint("10.0.0.7").unwrap(),
+            format!("http://10.0.0.7:{PORT}")
+        );
+        assert_eq!(
+            endpoint("fd00::7\n").unwrap(),
+            format!("http://[fd00::7]:{PORT}")
+        );
+        assert_eq!(endpoint(""), None);
+        assert_eq!(endpoint("node-1"), None);
+    }
+
     #[tokio::test]
     async fn the_host_socket_takes_views_without_a_token() {
         let node = node(GRACE).await;
@@ -458,12 +537,12 @@ mod tests {
         let node = node(GRACE).await;
         let wrong = publish(tcp_channel(node.port).await, Some("wrong")).await;
         let status = wrong.done.await.unwrap().unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(status.code(), Code::Unauthenticated);
 
         let none = publish(tcp_channel(node.port).await, None).await;
         assert_eq!(
             none.done.await.unwrap().unwrap_err().code(),
-            tonic::Code::Unauthenticated
+            Code::Unauthenticated
         );
 
         let token = node.view.token();
@@ -472,12 +551,17 @@ mod tests {
         settle().await;
         assert_eq!(node.view.current(), Some(view("", &[4])));
 
-        // Rotation takes effect for new streams at once.
+        // A new fabric holder: the view is withdrawn at once, the previous
+        // holder's open stream ends at its next message, and its token no
+        // longer opens a stream.
         let rotated = node.view.rotate_token().unwrap();
+        assert_eq!(node.view.current(), None);
+        right.tx.send(view("", &[4])).await.unwrap();
+        assert_eq!(right.done.await.unwrap().unwrap_err().code(), Code::Aborted);
         let stale = publish(tcp_channel(node.port).await, Some(&token)).await;
         assert_eq!(
             stale.done.await.unwrap().unwrap_err().code(),
-            tonic::Code::Unauthenticated
+            Code::Unauthenticated
         );
         let current = publish(tcp_channel(node.port).await, Some(&rotated)).await;
         current.tx.send(view("", &[5])).await.unwrap();
@@ -499,7 +583,7 @@ mod tests {
         // The first stream's next message is refused and ends it.
         first.tx.send(view("", &[3])).await.unwrap();
         let status = first.done.await.unwrap().unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(status.code(), Code::Aborted);
         assert_eq!(node.view.current(), Some(view("", &[2])));
         // Its end does not withdraw the second stream's view.
         drop(second.tx);
@@ -509,7 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_stream_withdraws_the_view_after_the_grace_period() {
-        let node = node(Duration::from_millis(100)).await;
+        let grace = Duration::from_millis(300);
+        let node = node(grace).await;
         let publisher = publish(unix_channel(&node.socket).await, None).await;
         publisher.tx.send(view("", &[1])).await.unwrap();
         settle().await;
@@ -518,21 +603,85 @@ mod tests {
         // Within the grace period the view stands, so a reconnect does not
         // flap the node's capacity.
         assert_eq!(node.view.current(), Some(view("", &[1])));
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(grace + settle_time()).await;
         assert_eq!(node.view.current(), None);
 
-        // A reconnect inside the grace period keeps it alive.
-        let again = publish(unix_channel(&node.socket).await, None).await;
-        again.tx.send(view("", &[1])).await.unwrap();
+        // A stream that opens after the grace period does not bring the
+        // old view back before it publishes its own.
+        let late = publish(unix_channel(&node.socket).await, None).await;
         settle().await;
-        drop(again.tx);
-        again.done.await.unwrap().unwrap();
+        assert_eq!(node.view.current(), None);
+        late.tx.send(view("", &[1])).await.unwrap();
+        settle().await;
+        assert_eq!(node.view.current(), Some(view("", &[1])));
+        drop(late.tx);
+        late.done.await.unwrap().unwrap();
+
+        // A reconnect inside the grace period keeps the view alive.
         let back = publish(unix_channel(&node.socket).await, None).await;
         back.tx.send(view("", &[1])).await.unwrap();
         settle().await;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(grace + settle_time()).await;
         assert_eq!(node.view.current(), Some(view("", &[1])));
         node.stop.cancel();
+    }
+
+    fn settle_time() -> Duration {
+        Duration::from_millis(50)
+    }
+
+    #[tokio::test]
+    async fn a_publisher_that_stops_answering_pings_is_closed() {
+        // A Service VM that dies hard leaves its TCP connection half open:
+        // nothing closes the stream.  The server's keepalive pings go
+        // unanswered, the stream is closed, and the grace period runs out.
+        let grace = Duration::from_millis(300);
+        let node = node(grace).await;
+        let socket = node.socket.clone();
+        let shared = node.view.clone();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let publisher = runtime.block_on(async {
+                let publisher = publish(unix_channel(&socket).await, None).await;
+                publisher.tx.send(view("", &[1])).await.unwrap();
+                until(&shared, |current| current.is_some()).await;
+                publisher
+            });
+            // The runtime is not polled from here on, so no ping is answered
+            // while the socket stays open.
+            let _ = held.recv();
+            drop(publisher);
+            drop(runtime);
+        });
+        until(&node.view, |current| current.is_some()).await;
+        until(&node.view, |current| current.is_none()).await;
+        drop(release);
+        client.join().unwrap();
+        node.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_the_open_stream_and_the_service() {
+        let node = node(GRACE).await;
+        let publisher = publish(unix_channel(&node.socket).await, None).await;
+        publisher.tx.send(view("", &[1])).await.unwrap();
+        settle().await;
+        node.stop.cancel();
+        let status = tokio::time::timeout(Duration::from_secs(2), publisher.done)
+            .await
+            .expect("the stream outlived the shutdown")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unavailable);
+        tokio::time::timeout(Duration::from_secs(2), node.served)
+            .await
+            .expect("the service outlived the shutdown")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -550,17 +699,5 @@ mod tests {
             // half must still have been replaced before the port was tried.
             Err(e) => assert!(e.to_string().contains(&PORT.to_string()), "{e:#}"),
         }
-    }
-
-    #[test]
-    fn describe_names_the_unit_and_the_active_partitions() {
-        assert_eq!(
-            describe(&view("gpu", &[])),
-            "unit \"gpu\", active partitions (id x gpus): none"
-        );
-        assert_eq!(
-            describe(&view("", &[2, 6])),
-            "unit \"\", active partitions (id x gpus): 2x2 6x2"
-        );
     }
 }
