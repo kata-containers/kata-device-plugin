@@ -29,7 +29,7 @@ In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partition
 **What the node advertises.**
 
 | node | view | unit | GPUs |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | fabric not VFIO-bound (host Fabric Manager, or no fabric) | none | | one device each, as before |
 | fabric VFIO-bound (a Service VM owns it) | none | | none, until the Service VM publishes |
 | any | present | `partition` or unset | one device per advertisable partition |

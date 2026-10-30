@@ -45,17 +45,35 @@ spec:
           args:
             - --resource-naming={{ .Values.resourceNaming }}
           {{- end }}
-          {{- with .Values.logFilter }}
           env:
+            # The node address the plugin advertises to the fabric holder,
+            # with the fabric view port below (see ARCHITECTURE.md, "Fabric
+            # partitions").
+            - name: KATA_DEVICE_PLUGIN_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- with .Values.logFilter }}
             - name: RUST_LOG
               value: {{ . | quote }}
-          {{- end }}
+            {{- end }}
+
+          ports:
+            # The fabric view service for the in-band publisher: the Service
+            # VM reaches the node address on this port, token-gated.  A
+            # hostPort keeps it node-local without a Service, matching the
+            # endpoint the plugin injects.
+            - name: fabric-view
+              containerPort: 9877
+              hostPort: 9877
+              protocol: TCP
 
           # No privileged flag, no added capabilities — ADR 10000.
           securityContext:
             allowPrivilegeEscalation: false
-            # All writes go to hostPath mounts (CDI specs, kubelet socket),
-            # which readOnlyRootFilesystem does not affect.
+            # All writes go to hostPath mounts (CDI specs, kubelet socket,
+            # the plugin's state), which readOnlyRootFilesystem does not
+            # affect.
             readOnlyRootFilesystem: true
             runAsUser: 0                    # kubelet socket ownership requires uid 0
             runAsNonRoot: false
@@ -72,6 +90,10 @@ spec:
               readOnly: true
             - name: cdi
               mountPath: /var/run/cdi
+            # The fabric view token and the host socket a publisher on the
+            # node uses; a pod restart keeps the token the Service VM holds.
+            - name: state
+              mountPath: /var/run/kata-device-plugin
 
           {{- with .Values.resources }}
           resources:
@@ -90,4 +112,8 @@ spec:
         - name: cdi
           hostPath:
             path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: /var/run/kata-device-plugin
             type: DirectoryOrCreate
