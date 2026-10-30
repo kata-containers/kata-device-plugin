@@ -30,6 +30,8 @@ fn parse_naming() -> anyhow::Result<vfio::Naming> {
 fn spawn_server(
     name: &str,
     naming: vfio::Naming,
+    view: &Arc<view::View>,
+    advertise: &Option<String>,
     shutdown: &CancellationToken,
     running: &Arc<Mutex<HashSet<String>>>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
@@ -42,7 +44,8 @@ fn spawn_server(
         vfio::SYSFS_ROOT,
         plugin::SOCKET_DIR,
         plugin::CDI_DIR,
-    );
+    )
+    .with_view(view.clone(), advertise.clone());
     let token = shutdown.clone();
     let label = name.to_owned();
     let set = running.clone();
@@ -87,6 +90,16 @@ async fn main() -> anyhow::Result<()> {
     // without a view, which they fail closed on; GPU-only nodes do not
     // need it, so it is not fatal for the device servers below.
     let view = view::View::load(Path::new(view::STATE_DIR))?;
+    let advertise = std::env::var(view::HOST_IP_ENV)
+        .ok()
+        .filter(|ip| !ip.is_empty())
+        .map(|ip| format!("http://{ip}:{}", view::PORT));
+    if advertise.is_none() {
+        tracing::warn!(
+            "{} is not set: the fabric holder gets a token but no endpoint",
+            view::HOST_IP_ENV
+        );
+    }
     match view::bind(Path::new(view::SOCKET)).await {
         Ok((unix, tcp)) => {
             let view = view.clone();
@@ -119,7 +132,9 @@ async fn main() -> anyhow::Result<()> {
         }
         for name in desired {
             if !running.lock().unwrap().contains(&name) {
-                spawn_server(&name, naming, &shutdown, &running, &mut tasks);
+                spawn_server(
+                    &name, naming, &view, &advertise, &shutdown, &running, &mut tasks,
+                );
             }
         }
         tokio::select! {

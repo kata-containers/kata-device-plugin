@@ -11,11 +11,13 @@ use container_device_interface::specs::config::Spec;
 use kata_device_plugin::dp::v1beta1::{
     device_plugin_client::DevicePluginClient,
     registration_server::{Registration, RegistrationServer},
-    AllocateRequest, ContainerAllocateRequest, Empty, ListAndWatchResponse,
-    PreStartContainerRequest, PreferredAllocationRequest, RegisterRequest,
+    AllocateRequest, ContainerAllocateRequest, ContainerAllocateResponse, Empty,
+    ListAndWatchResponse, PreStartContainerRequest, PreferredAllocationRequest, RegisterRequest,
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
+use kata_device_plugin::view::{View, GRACE};
+use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
 use pcilibs_rs::testfs::{add as add_dev, add_connectx};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
@@ -820,4 +822,107 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
     );
 
     node.shutdown().await;
+}
+
+/// A server on `name` over `vfio`, given the view, serving without a kubelet.
+async fn server_with_view(
+    name: &str,
+    vfio: &TempDir,
+    sockets: &TempDir,
+    view: &Arc<View>,
+    advertise: Option<&str>,
+) -> (
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let cdi = TempDir::new().unwrap();
+    let server = DeviceServer::new(
+        name,
+        Naming::Alias,
+        vfio.path().to_str().unwrap(),
+        vfio.path().to_str().unwrap(),
+        sockets.path().to_str().unwrap(),
+        cdi.path().to_str().unwrap(),
+    )
+    .with_view(view.clone(), advertise.map(str::to_owned));
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(server.run(token.clone()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::mem::forget(cdi);
+    (token, handle)
+}
+
+async fn allocate_first(sock: PathBuf) -> ContainerAllocateResponse {
+    unix_client(sock)
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["0".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .container_responses
+        .remove(0)
+}
+
+#[tokio::test]
+async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
+    // The Service VM must learn where to publish and with which token, and
+    // only it: a GPU's holder learns nothing.  Each fabric allocation rotates
+    // the token so the previous holder's copy stops working.
+    let vfio = TempDir::new().unwrap();
+    for (n, function, marker) in [(1, 0, true), (3, 1, true), (4, 2, false), (5, 3, false)] {
+        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
+    }
+    add_dev(vfio.path(), 2, 0x10de, 0x2330, 0x030200);
+    let state = TempDir::new().unwrap();
+    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let before = view.token();
+    let sockets = TempDir::new().unwrap();
+
+    let (fabric_stop, fabric) = server_with_view(
+        "nvidia.com/nvswitch-fabric",
+        &vfio,
+        &sockets,
+        &view,
+        Some("http://10.0.0.7:9877"),
+    )
+    .await;
+    let resp = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    assert_eq!(resp.cdi_devices[0].name, "nvidia.com/nvswitch-fabric=0");
+    let token = view.token();
+    assert_ne!(
+        token, before,
+        "the token rotates on every fabric allocation"
+    );
+    assert_eq!(resp.envs[TOKEN_ENV], token);
+    assert_eq!(resp.envs[ENDPOINT_ENV], "http://10.0.0.7:9877");
+    assert_eq!(resp.envs.len(), 2);
+
+    let again = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    assert_ne!(again.envs[TOKEN_ENV], token);
+    assert_eq!(again.envs[TOKEN_ENV], view.token());
+
+    // A GPU's holder learns nothing, with or without a node address.
+    let (gpu_stop, gpu) = server_with_view("nvidia.com/gpu", &vfio, &sockets, &view, None).await;
+    let resp = allocate_first(sockets.path().join("kata-gpu.sock")).await;
+    assert_eq!(resp.cdi_devices[0].name, "nvidia.com/gpu=0");
+    assert!(resp.envs.is_empty());
+    assert_eq!(view.token(), again.envs[TOKEN_ENV]);
+
+    // Without a node address the holder still gets the token.
+    fabric_stop.cancel();
+    fabric.await.unwrap().unwrap();
+    let (fabric_stop, fabric) =
+        server_with_view("nvidia.com/nvswitch-fabric", &vfio, &sockets, &view, None).await;
+    let resp = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    assert_eq!(resp.envs.len(), 1);
+    assert_eq!(resp.envs[TOKEN_ENV], view.token());
+
+    for (stop, handle) in [(fabric_stop, fabric), (gpu_stop, gpu)] {
+        stop.cancel();
+        handle.await.unwrap().unwrap();
+    }
 }
