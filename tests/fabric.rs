@@ -19,7 +19,7 @@ use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
 use pcilibs_rs::testfs::{add as add_dev, add_connectx};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
+use tonic::{Request, Status};
 
 use common::*;
 
@@ -123,19 +123,20 @@ async fn server_with_view(
     (token, handle)
 }
 
-async fn allocate_first(sock: PathBuf) -> ContainerAllocateResponse {
+async fn allocate(sock: PathBuf, ids: &[&str]) -> Result<Vec<ContainerAllocateResponse>, Status> {
     unix_client(sock)
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned()],
+                devices_i_ds: ids.iter().map(|id| id.to_string()).collect(),
             }],
         }))
         .await
-        .unwrap()
-        .into_inner()
-        .container_responses
-        .remove(0)
+        .map(|response| response.into_inner().container_responses)
+}
+
+async fn allocate_first(sock: PathBuf) -> ContainerAllocateResponse {
+    allocate(sock, &["0"]).await.unwrap().remove(0)
 }
 
 #[tokio::test]
@@ -201,6 +202,37 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
         stop.cancel();
         handle.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn a_failed_or_empty_allocate_keeps_the_holders_token() {
+    // The token rotates only when the fabric changes hands.  A request for
+    // a device that is gone fails, and one that asks for nothing hands the
+    // fabric to nobody; neither revokes the current holder's token.
+    let vfio = TempDir::new().unwrap();
+    for (n, function, marker) in [(0, 0, true), (1, 1, true), (2, 2, false), (3, 3, false)] {
+        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
+    }
+    let state = TempDir::new().unwrap();
+    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let sockets = TempDir::new().unwrap();
+    let (stop, server) =
+        server_with_view("nvidia.com/nvswitch-fabric", &vfio, &sockets, &view, None).await;
+    let sock = sockets.path().join("kata-nvswitch-fabric.sock");
+
+    let holder = allocate_first(sock.clone()).await.envs[TOKEN_ENV].clone();
+    assert_eq!(holder, view.token());
+
+    let status = allocate(sock.clone(), &["1"]).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(view.token(), holder);
+
+    let empty = allocate(sock, &[]).await.unwrap().remove(0);
+    assert!(empty.cdi_devices.is_empty() && empty.envs.is_empty());
+    assert_eq!(view.token(), holder);
+
+    stop.cancel();
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test]

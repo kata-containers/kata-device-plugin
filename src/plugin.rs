@@ -419,8 +419,10 @@ impl DevicePlugin for DeviceServer {
                 "CDI registry for {resource_name} is not writable: {e:#}"
             )));
         }
-        let envs = self.publisher_env()?;
-        let mut responses = Vec::new();
+        // Every ID is checked before the fabric's token rotates: a request
+        // that fails, or asks for nothing, must not revoke the current
+        // holder's token.
+        let mut allocations = Vec::new();
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();
             for id in cr.devices_i_ds {
@@ -436,14 +438,23 @@ impl DevicePlugin for DeviceServer {
                     }
                 }
             }
-            responses.push(ContainerAllocateResponse {
+            allocations.push(cdi_devices);
+        }
+        let envs = if allocations.iter().all(Vec::is_empty) {
+            HashMap::new()
+        } else {
+            self.publisher_env()?
+        };
+        let container_responses = allocations
+            .into_iter()
+            .map(|cdi_devices| ContainerAllocateResponse {
                 cdi_devices,
                 envs: envs.clone(),
                 ..Default::default()
-            });
-        }
+            })
+            .collect();
         Ok(Response::new(AllocateResponse {
-            container_responses: responses,
+            container_responses,
         }))
     }
 
