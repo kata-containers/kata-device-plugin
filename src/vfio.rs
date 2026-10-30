@@ -482,8 +482,10 @@ mod tests {
         testfs::add_connectx(r, 1, "0000:05:00.0", true);
         testfs::add_connectx(r, 2, "0000:05:00.1", false);
         testfs::add_nvswitch(r, 3);
+        // Every ConnectX fixture has a VPD; swap the file for a directory.
         let vpd = Sysfs::new(r).device("0000:05:00.1").unwrap().join("vpd");
-        std::fs::create_dir(vpd).unwrap();
+        std::fs::remove_file(&vpd).unwrap();
+        std::fs::create_dir(&vpd).unwrap();
 
         let map = discover(r, &Sysfs::new(r), Naming::Alias);
         assert_eq!(map.len(), 1);
