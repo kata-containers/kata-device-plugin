@@ -164,8 +164,12 @@ The Static checks workflow runs this command on every pull request and fails
 if the committed files differ. The Release workflow checks them again before
 publishing.
 
-The DaemonSet mounts three host paths: the kubelet device-plugin socket
-directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
+The DaemonSet mounts four host paths: the kubelet device-plugin socket
+directory, `/dev/vfio` (read-only), `/var/run/cdi`, and
+`/var/run/kata-device-plugin` for the fabric view token and the host socket a
+publisher on the node uses. It exposes one hostPort, 9877, the fabric view
+service the Service VM's Fabric Manager client publishes to, token-gated (see
+ARCHITECTURE.md, "Fabric partitions"). It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
 root filesystem — root is required because the kubelet owns its socket
 directory and because PCI VPD, which identifies the NVSwitch management PFs,
