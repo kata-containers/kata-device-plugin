@@ -161,7 +161,7 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
         let Some(row) = RESOURCES.iter().find(|r| {
             r.matches(&dev)
                 && (r.unit != Unit::Fabric
-                    || topology().is_some_and(|t| fabric(t).any(|bdf| bdf == dev.bdf)))
+                    || topology().is_some_and(|t| t.fabric().any(|bdf| bdf == dev.bdf)))
         }) else {
             continue;
         };
@@ -171,7 +171,7 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
                     Naming::Alias => row.name.to_owned(),
                     Naming::Sku => sku_name(row, &dev),
                 };
-                let slot = slot(&dev.bdf).to_owned();
+                let slot = pcilibs_rs::slot(&dev.bdf).to_owned();
                 pci.entry(name)
                     .or_default()
                     .entry(slot)
@@ -191,7 +191,7 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
     fabrics.retain(|name, device| {
         let missing: Vec<&str> = topology()
             .into_iter()
-            .flat_map(fabric)
+            .flat_map(Topology::fabric)
             .filter(|bdf| !device.iter().any(|cdev| cdev.bdf == *bdf))
             .collect();
         if !missing.is_empty() {
@@ -213,22 +213,6 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
                 .map(|(name, device)| (name, vec![device])),
         )
         .collect()
-}
-
-/// `0000:27:00.1` → `0000:27:00`: the PCI device its functions share.
-fn slot(bdf: &str) -> &str {
-    bdf.rsplit_once('.').map_or(bdf, |(slot, _)| slot)
-}
-
-/// The fabric a Service VM is given whole (HGX guide 19.0, section 3.2.2):
-/// the switch chips where they are PCI functions, the management ConnectX
-/// PFs where they are not.
-fn fabric(topology: &Topology) -> impl Iterator<Item = &str> {
-    topology
-        .switches
-        .iter()
-        .map(String::as_str)
-        .chain(topology.management_functions.iter().map(|f| f.bdf.as_str()))
 }
 
 /// The node's switch chips and NVSwitch management PFs, bound or not.  The
@@ -304,11 +288,11 @@ pub(crate) mod testfs {
     /// An H100 SXM5 80GB: pci-ids 10de:2330, so SKU naming is exercised
     /// against the real database.
     pub fn add_gpu(root: &Path, n: u32) {
-        add(root, n, "0x10de", "0x2330", "0x030200");
+        add(root, n, 0x10de, 0x2330, 0x030200);
     }
 
     pub fn add_nvswitch(root: &Path, n: u32) {
-        add(root, n, "0x10de", "0x22a3", "0x068000");
+        add(root, n, 0x10de, 0x22a3, 0x068000);
     }
 }
 
@@ -332,7 +316,7 @@ mod tests {
         testfs::add_gpu(root.path(), 7);
         testfs::add_nvswitch(root.path(), 9);
         // A VFIO-bound NIC must not be advertised under any resource.
-        testfs::add(root.path(), 3, "0x15b3", "0x101e", "0x020000");
+        testfs::add(root.path(), 3, 0x15b3, 0x101e, 0x020000);
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
@@ -363,7 +347,7 @@ mod tests {
     #[test]
     fn sku_mode_unknown_device_falls_back_to_row_name() {
         let root = TempDir::new().unwrap();
-        testfs::add(root.path(), 0, "0x10de", "0xdead", "0x030200");
+        testfs::add(root.path(), 0, 0x10de, 0xdead, 0x030200);
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
         assert_eq!(map.len(), 1);
