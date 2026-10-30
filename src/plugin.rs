@@ -133,7 +133,8 @@ impl DeviceServer {
     /// This server's devices under the current scan: the discover() group
     /// matching our resolved name.
     fn my_devices(&self) -> Vec<vfio::Device> {
-        vfio::discover(&self.device_dir, &self.sysfs, self.naming)
+        let view = self.view.as_ref().and_then(|view| view.current());
+        vfio::discover(&self.device_dir, &self.sysfs, self.naming, view.as_ref())
             .remove(&self.name)
             .unwrap_or_default()
     }

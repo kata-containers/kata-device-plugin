@@ -1,8 +1,9 @@
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use pcilibs_rs::platform::Topology;
+use pcilibs_rs::fabric::{self, v1::FabricView};
+use pcilibs_rs::platform::{GpuFunction, Topology};
 pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
 /// One advertised device: the bound functions it spans, in cdev order.  This
@@ -143,13 +144,29 @@ pub const RESOURCES: &[Resource] = &[
 /// survives a reboot where cdev numbers do not, and a fabric is one device,
 /// advertised whole or not at all.  That order fixes the advertised device
 /// IDs / CDI spec indices.
-pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Device>> {
+///
+/// `view` is the fabric partition view the Service VM's Fabric Manager
+/// client published, if a fresh one exists.  It decides how GPUs are
+/// advertised, because in shared NVSwitch mode GPUs that share an active
+/// partition reach each other over NVLink and a tenant must get exactly one
+/// partition: with a view, [`partition_units`]; without one, GPUs are
+/// advertised one by one unless the node's fabric is VFIO-bound, which means
+/// a Service VM owns it and its view is simply not there yet, so no GPU is
+/// advertised until it is.
+pub fn discover(
+    vfio_dir: &Path,
+    sysfs: &Sysfs,
+    naming: Naming,
+    view: Option<&FabricView>,
+) -> BTreeMap<String, Vec<Device>> {
     // Name, then PCI slot, then the slot's bound functions.  No row has a
     // multi-function PCI device today; the slot is the principle
     // ARCHITECTURE.md states, functions are never separate devices, and the
     // order key.
     let mut pci: BTreeMap<String, BTreeMap<String, Device>> = BTreeMap::new();
     let mut fabrics: BTreeMap<String, Device> = BTreeMap::new();
+    // The names GPU rows resolved to; those are what a partition view shapes.
+    let mut gpu_names: BTreeSet<String> = BTreeSet::new();
     // The topology scan reads every Mellanox PF's VPD, so it runs at most
     // once per pass, and not at all unless a fabric row has a candidate.
     let scanned: OnceCell<Option<Topology>> = OnceCell::new();
@@ -172,6 +189,9 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
                     Naming::Sku => sku_name(row, &dev),
                 };
                 let slot = pcilibs_rs::slot(&dev.bdf).to_owned();
+                if row.class_prefix == GPU_CLASS {
+                    gpu_names.insert(name.clone());
+                }
                 pci.entry(name)
                     .or_default()
                     .entry(slot)
@@ -205,14 +225,134 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
         }
         missing.is_empty()
     });
+    // GPUs follow the view; everything else is advertised as scanned.
+    let gpus: BTreeMap<String, BTreeMap<String, Device>> = gpu_names
+        .iter()
+        .filter_map(|name| pci.remove_entry(name))
+        .collect();
+    let gpu_units = match view {
+        Some(view) => partition_units(view, sysfs, gpus),
+        None if !fabrics.is_empty() => {
+            tracing::warn!(
+                "fabric is bound but no partition view is published: advertising no GPU"
+            );
+            BTreeMap::new()
+        }
+        None => by_slot(gpus),
+    };
     pci.into_iter()
         .map(|(name, devices)| (name, devices.into_values().collect()))
+        .chain(gpu_units)
         .chain(
             fabrics
                 .into_iter()
                 .map(|(name, device)| (name, vec![device])),
         )
         .collect()
+}
+
+/// PCI class of a 3D controller: the rows whose devices a partition view
+/// regroups.
+const GPU_CLASS: u16 = 0x0302;
+
+/// One advertised device per GPU, in PCI order: the unit when nothing says
+/// how GPUs relate to each other.
+fn by_slot(gpus: BTreeMap<String, BTreeMap<String, Device>>) -> BTreeMap<String, Vec<Device>> {
+    gpus.into_iter()
+        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .collect()
+}
+
+/// The view's unit applied to the bound GPUs.  Unit `gpu` is the owner
+/// saying the node is theirs whole, so GPUs stay one device each.  Unit
+/// `partition` makes every advertisable partition one device holding all
+/// its GPUs' functions, named by size, `nvidia.com/nvlink-4gpu`, because a
+/// count under `nvidia.com/gpu` cannot tell four NVLinked GPUs from four
+/// standalone ones and only a per-shape ledger lets the scheduler see how
+/// many partitions remain.  A single-GPU partition is a plain GPU.  Devices
+/// are ordered by partition id, and a partition's functions by Fabric
+/// Manager's member order.
+///
+/// Fabric Manager names GPUs by module slot; the host resolves those through
+/// the firmware's slot labels.  Resolution needs every member bound here, so
+/// `complete` is judged on bound GPUs only, and a GPU without a parsable
+/// label resolves to nothing: an unknown board advertises no partition
+/// rather than a wrong one.
+fn partition_units(
+    view: &FabricView,
+    sysfs: &Sysfs,
+    gpus: BTreeMap<String, BTreeMap<String, Device>>,
+) -> BTreeMap<String, Vec<Device>> {
+    // Every bound GPU by PCI slot, with the name its row resolved to.
+    let bound: BTreeMap<String, (String, Device)> = gpus
+        .iter()
+        .flat_map(|(name, devices)| {
+            devices
+                .iter()
+                .map(move |(slot, device)| (slot.clone(), (name.clone(), device.clone())))
+        })
+        .collect();
+    let functions: Vec<GpuFunction> = bound
+        .values()
+        .map(|(_, device)| GpuFunction {
+            bdf: device[0].bdf.clone(),
+            vendor: u32::from(device[0].vendor),
+        })
+        .collect();
+    let modules = match fabric::gpu_modules(sysfs, &functions) {
+        Ok(modules) => modules,
+        Err(e) => {
+            tracing::warn!("GPU slot labels are unreadable, advertising no GPU: {e}");
+            return BTreeMap::new();
+        }
+    };
+    let Some(resolved) = fabric::resolve(view, &modules) else {
+        tracing::warn!(
+            unit = %view.unit,
+            "partition view carries an unknown unit, advertising no GPU"
+        );
+        return BTreeMap::new();
+    };
+    if resolved.unit == fabric::Unit::Gpu {
+        return by_slot(gpus);
+    }
+    let mut units: BTreeMap<String, Vec<Device>> = BTreeMap::new();
+    let mut withheld: Vec<String> = Vec::new();
+    for partition in resolved.partitions.iter().filter(|p| p.active) {
+        if !partition.advertisable() {
+            let why = if !partition.supported {
+                "unsupported"
+            } else if !partition.exclusive {
+                "shares a GPU with another active partition"
+            } else {
+                "not every GPU is bound and labeled here"
+            };
+            withheld.push(format!("{}: {why}", partition.id));
+            continue;
+        }
+        // `bdfs()` are the functions passed in above, so every slot is here.
+        let members: Vec<&(String, Device)> = partition
+            .bdfs()
+            .filter_map(|bdf| bound.get(pcilibs_rs::slot(bdf)))
+            .collect();
+        let size = members.len();
+        let (row_name, _) = members[0];
+        let name = if size == 1 {
+            row_name.clone()
+        } else {
+            let domain = row_name.split('/').next().unwrap_or("nvidia.com");
+            format!("{domain}/nvlink-{size}gpu")
+        };
+        let device: Device = members
+            .iter()
+            .flat_map(|(_, device)| device.iter().cloned())
+            .collect();
+        units.entry(name).or_default().push(device);
+    }
+    if !withheld.is_empty() {
+        tracing::warn!(?withheld, "active partitions not advertised");
+    }
+    units
 }
 
 /// The node's switch chips and NVSwitch management PFs, bound or not.  The
@@ -294,6 +434,13 @@ pub(crate) mod testfs {
     pub fn add_nvswitch(root: &Path, n: u32) {
         add(root, n, 0x10de, 0x22a3, 0x068000);
     }
+
+    /// A GPU at `address` whose firmware labels module slot `module`, the
+    /// way DGX firmware does ("GPU0, SMX7"), as cdev `n`.
+    pub fn add_gpu_at(root: &Path, n: u32, address: &str, module: u8) {
+        let function = pcilibs_rs::testfs::add_at(root, n, address, 0x10de, 0x2330, 0x030200);
+        std::fs::write(function.join("label"), format!("GPU{n}, SMX{module}\n")).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -318,11 +465,24 @@ mod tests {
         // A VFIO-bound NIC must not be advertised under any resource.
         testfs::add(root.path(), 3, 0x15b3, 0x101e, 0x020000);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None);
+        // The switch chip is the node's fabric, bound: without a view the GPUs
+        // are withheld; with the owner's unit `gpu` they are one device each.
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["nvidia.com/nvswitch-fabric"]
+        );
+        assert_eq!(nums(&map["nvidia.com/nvswitch-fabric"]), vec![vec![9]]);
+        let gpu = view("gpu", &[]);
+        let map = discover(
+            root.path(),
+            &Sysfs::new(root.path()),
+            Naming::Alias,
+            Some(&gpu),
+        );
         assert_eq!(map.len(), 2);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![7], vec![42]]);
         assert!(map["nvidia.com/gpu"][0][0].path.ends_with("devices/vfio7"));
-        assert_eq!(nums(&map["nvidia.com/nvswitch-fabric"]), vec![vec![9]]);
     }
 
     #[test]
@@ -331,7 +491,7 @@ mod tests {
         testfs::add_gpu(root.path(), 0);
         testfs::add_gpu(root.path(), 1);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku, None);
         assert_eq!(map.len(), 1);
         let (name, devs) = map.iter().next().unwrap();
         // Loose on the marketing suffix: the database may reword it, but the
@@ -349,7 +509,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         testfs::add(root.path(), 0, 0x10de, 0xdead, 0x030200);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku, None);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("nvidia.com/gpu"));
     }
@@ -406,13 +566,18 @@ mod tests {
         testfs::add_gpu(r, 2);
         testfs::add_connectx(r, 6, "0000:18:00.0", false);
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
-        assert_eq!(map.len(), 2);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![2]]);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["nvidia.com/nvswitch-fabric"]
+        );
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 3, 4, 5]]
         );
+        let gpu = view("gpu", &[]);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, Some(&gpu));
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![2]]);
     }
 
     #[test]
@@ -425,7 +590,7 @@ mod tests {
             testfs::add_nvswitch(r, n);
         }
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 2, 3, 4]]
@@ -447,12 +612,12 @@ mod tests {
         }
         std::fs::remove_file(r.join("devices/vfio4")).unwrap();
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(map.len(), 1);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
 
         std::fs::write(r.join("devices/vfio4"), b"").unwrap();
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 2, 3, 4]]
@@ -467,7 +632,7 @@ mod tests {
         for function in 2..4u32 {
             std::fs::remove_file(r.join(format!("devices/vfio{function}"))).unwrap();
         }
-        assert!(discover(r, &Sysfs::new(r), Naming::Alias).is_empty());
+        assert!(discover(r, &Sysfs::new(r), Naming::Alias, None).is_empty());
     }
 
     #[test]
@@ -487,7 +652,7 @@ mod tests {
         std::fs::remove_file(&vpd).unwrap();
         std::fs::create_dir(&vpd).unwrap();
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(map.len(), 1);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
     }
@@ -499,7 +664,7 @@ mod tests {
         let r = root.path();
         testfs::add_connectx(r, 0, "0000:05:00.0", true);
 
-        let map = discover(r, &Sysfs::new(r), Naming::Sku);
+        let map = discover(r, &Sysfs::new(r), Naming::Sku, None);
         assert_eq!(
             map.keys().collect::<Vec<_>>(),
             ["nvidia.com/nvswitch-fabric"]
@@ -514,14 +679,14 @@ mod tests {
         std::fs::write(devices.join("vfio0"), b"").unwrap();
 
         for naming in [Naming::Alias, Naming::Sku] {
-            assert!(discover(root.path(), &Sysfs::new(root.path()), naming).is_empty());
+            assert!(discover(root.path(), &Sysfs::new(root.path()), naming, None).is_empty());
         }
     }
 
     #[test]
     fn missing_devices_dir_is_empty() {
         let root = TempDir::new().unwrap();
-        assert!(discover(root.path(), &Sysfs::new(root.path()), Naming::Alias).is_empty());
+        assert!(discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None).is_empty());
     }
 
     #[test]
@@ -554,5 +719,246 @@ mod tests {
         assert!(matches!(Naming::parse("sku"), Ok(Naming::Sku)));
         assert!(Naming::parse("SKU").is_err());
         assert!(Naming::parse("").is_err());
+    }
+
+    use pcilibs_rs::fabric::v1;
+
+    /// The first four GPUs of a DGX NVL8, labeled as its firmware does:
+    /// cdev n at a slot whose module is Fabric Manager's physical id.
+    fn four_labeled_gpus(r: &Path) {
+        for (n, address, module) in [
+            (0, "0000:1a:00.0", 7),
+            (1, "0000:3c:00.0", 6),
+            (2, "0000:62:00.0", 8),
+            (3, "0000:73:00.0", 5),
+        ] {
+            testfs::add_gpu_at(r, n, address, module);
+        }
+    }
+
+    /// A view with the given partitions, `(id, active, members)`.
+    fn view(unit: &str, partitions: &[(u32, bool, &[u32])]) -> FabricView {
+        FabricView {
+            partitions: Some(v1::PartitionList {
+                version: 1,
+                max_num_partitions: 15,
+                partition_info: partitions
+                    .iter()
+                    .map(|&(id, active, members)| v1::Partition {
+                        partition_id: id,
+                        is_active: active,
+                        gpu_info: members
+                            .iter()
+                            .map(|&physical_id| v1::PartitionGpu {
+                                physical_id,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+            unsupported: None,
+            unit: unit.to_owned(),
+        }
+    }
+
+    /// The DGX table's two pairs over these GPUs: 6 = (5,6), 7 = (7,8).
+    const PAIRS: &[(u32, bool, &[u32])] = &[(6, true, &[5, 6]), (7, true, &[7, 8])];
+
+    #[test]
+    fn active_partitions_are_one_device_each_named_by_size() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", PAIRS)),
+        );
+        // Devices by partition id, functions in Fabric Manager's member order.
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["nvidia.com/nvlink-2gpu"]);
+        assert_eq!(
+            nums(&map["nvidia.com/nvlink-2gpu"]),
+            vec![vec![3, 1], vec![0, 2]]
+        );
+        // An unset unit is the same.
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, Some(&view("", PAIRS)));
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]).len(), 2);
+    }
+
+    #[test]
+    fn a_single_gpu_partition_is_a_plain_gpu_and_inactive_gpus_are_withheld() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        let singles: &[(u32, bool, &[u32])] = &[
+            (12, true, &[5]),
+            (14, true, &[7]),
+            (13, false, &[6]),
+            (15, false, &[8]),
+        ];
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", singles)),
+        );
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["nvidia.com/gpu"]);
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![3], vec![0]]);
+    }
+
+    #[test]
+    fn a_half_and_two_singles_at_once() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        let carve: &[(u32, bool, &[u32])] = &[
+            (3, true, &[5, 6, 7, 8]),
+            (12, false, &[5]),
+            (14, false, &[7]),
+        ];
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", carve)),
+        );
+        assert_eq!(nums(&map["nvidia.com/nvlink-4gpu"]), vec![vec![3, 1, 0, 2]]);
+        assert!(!map.contains_key("nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn incomplete_unsupported_and_overlapping_partitions_are_withheld() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        // GPU 6 (cdev 1) is present but no longer bound: its pair is out, the
+        // other pair stands.
+        std::fs::remove_file(r.join("devices/vfio1")).unwrap();
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", PAIRS)),
+        );
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![0, 2]]);
+
+        // Fabric Manager lists pair 7 as unsupported: out as well.
+        let mut unsupported = view("partition", PAIRS);
+        unsupported.unsupported = Some(v1::UnsupportedPartitionList {
+            version: 1,
+            partition_info: vec![v1::UnsupportedPartition {
+                partition_id: 7,
+                gpu_physical_ids: vec![7, 8],
+            }],
+        });
+        assert!(discover(r, &Sysfs::new(r), Naming::Alias, Some(&unsupported)).is_empty());
+
+        // Two active partitions naming GPU 7: neither is a unit.
+        std::fs::write(r.join("devices/vfio1"), b"").unwrap();
+        let overlap: &[(u32, bool, &[u32])] =
+            &[(7, true, &[7, 8]), (14, true, &[7]), (6, true, &[5, 6])];
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", overlap)),
+        );
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["nvidia.com/nvlink-2gpu"]);
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![3, 1]]);
+    }
+
+    #[test]
+    fn an_unlabeled_gpu_takes_its_partition_down_not_the_others() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        std::fs::remove_file(Sysfs::new(r).device("0000:62:00.0").unwrap().join("label")).unwrap();
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", PAIRS)),
+        );
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![3, 1]]);
+    }
+
+    #[test]
+    fn unit_gpu_is_one_device_per_gpu_whatever_the_partitions() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, Some(&view("gpu", PAIRS)));
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["nvidia.com/gpu"]);
+        assert_eq!(
+            nums(&map["nvidia.com/gpu"]),
+            vec![vec![0], vec![1], vec![2], vec![3]]
+        );
+    }
+
+    #[test]
+    fn an_unknown_unit_or_unreadable_labels_advertise_no_gpu() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        assert!(discover(r, &Sysfs::new(r), Naming::Alias, Some(&view("tray", PAIRS))).is_empty());
+        // A label that cannot be read at all is not an unlabeled board: fail.
+        let label = Sysfs::new(r).device("0000:1a:00.0").unwrap().join("label");
+        std::fs::remove_file(&label).unwrap();
+        std::fs::create_dir(&label).unwrap();
+        assert!(discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", PAIRS))
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_bound_fabric_without_a_view_advertises_no_gpu() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        for n in 10..=13u32 {
+            testfs::add_nvswitch(r, n);
+        }
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["nvidia.com/nvswitch-fabric"]
+        );
+        // The view arriving turns the GPUs into partitions; a view also wins
+        // when the fabric is not bound at all, the host-FM case.
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Alias,
+            Some(&view("partition", PAIRS)),
+        );
+        assert_eq!(map.len(), 2);
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]).len(), 2);
+    }
+
+    #[test]
+    fn sku_mode_names_singles_by_sku_and_partitions_by_size() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        four_labeled_gpus(r);
+        let mixed: &[(u32, bool, &[u32])] = &[(6, true, &[5, 6]), (14, true, &[7])];
+        let map = discover(
+            r,
+            &Sysfs::new(r),
+            Naming::Sku,
+            Some(&view("partition", mixed)),
+        );
+        let names: Vec<&String> = map.keys().collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.iter().any(|n| n.starts_with("nvidia.com/GH100")),
+            "{names:?}"
+        );
+        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![3, 1]]);
     }
 }
