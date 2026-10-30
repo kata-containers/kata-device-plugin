@@ -40,6 +40,10 @@ const TOKEN_FILE: &str = "fabric-view.token";
 /// Where in-band publishers reach the plugin: the pod's port, exposed on the
 /// node by the chart.  Fixed, like the kubelet's socket directory.
 pub const PORT: u16 = 9877;
+/// The node address the chart passes in from the downward API
+/// (`status.hostIP`).  The plugin advertises `http://<ip>:PORT` to the
+/// fabric holder; without it the holder gets a token and no endpoint.
+pub const HOST_IP_ENV: &str = "KATA_DEVICE_PLUGIN_HOST_IP";
 /// Three of the publisher's five-second polls: a reconnect lands well
 /// inside it, a dead publisher is noticed before the kubelet's next look.
 pub const GRACE: Duration = Duration::from_secs(15);

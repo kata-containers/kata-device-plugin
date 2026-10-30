@@ -11,8 +11,14 @@ use tonic::{Request, Response, Status};
 use tower::service_fn;
 use tracing::info;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
+
 use crate::cdi;
 use crate::vfio::{self, Naming, Sysfs};
+use crate::view::View;
 
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -55,6 +61,10 @@ pub struct DeviceServer {
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
     endpoint_shutdown: CancellationToken,
+    /// Set on every server; only the fabric's uses it, at Allocate.
+    view: Option<Arc<View>>,
+    /// Where the fabric holder publishes to, when the node address is known.
+    advertise: Option<String>,
 }
 
 impl DeviceServer {
@@ -74,7 +84,50 @@ impl DeviceServer {
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
             endpoint_shutdown: CancellationToken::new(),
+            view: None,
+            advertise: None,
         }
+    }
+
+    /// Make the fabric's Allocate hand its holder the publishing endpoint
+    /// and a fresh token.  `advertise` is `http://<node ip>:<port>`, or
+    /// `None` when the node address is unknown.
+    pub fn with_view(mut self, view: Arc<View>, advertise: Option<String>) -> Self {
+        self.view = Some(view);
+        self.advertise = advertise;
+        self
+    }
+
+    /// Whether this server hands out the node's fabric, the one device whose
+    /// holder is the Service VM.
+    fn serves_fabric(&self) -> bool {
+        vfio::RESOURCES
+            .iter()
+            .any(|row| row.name == self.name && row.unit == vfio::Unit::Fabric)
+    }
+
+    /// The environment the fabric's new holder publishes with.  Rotating the
+    /// token here is what makes the previous holder's copy stop working the
+    /// moment the fabric changes hands.
+    fn publisher_env(&self) -> Result<HashMap<String, String>, Status> {
+        let Some(view) = self.view.as_ref().filter(|_| self.serves_fabric()) else {
+            return Ok(HashMap::new());
+        };
+        let token = view.rotate_token().map_err(|e| {
+            Status::unavailable(format!("fabric view token cannot be written: {e:#}"))
+        })?;
+        let mut envs = HashMap::from([(TOKEN_ENV.to_owned(), token)]);
+        match &self.advertise {
+            Some(endpoint) => {
+                envs.insert(ENDPOINT_ENV.to_owned(), endpoint.clone());
+                info!(
+                    endpoint,
+                    "fabric allocated: holder gets endpoint and a fresh token"
+                );
+            }
+            None => info!("fabric allocated: holder gets a fresh token, no endpoint is known"),
+        }
+        Ok(envs)
     }
 
     /// This server's devices under the current scan: the discover() group
@@ -365,6 +418,7 @@ impl DevicePlugin for DeviceServer {
                 "CDI registry for {resource_name} is not writable: {e:#}"
             )));
         }
+        let envs = self.publisher_env()?;
         let mut responses = Vec::new();
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();
@@ -383,6 +437,7 @@ impl DevicePlugin for DeviceServer {
             }
             responses.push(ContainerAllocateResponse {
                 cdi_devices,
+                envs: envs.clone(),
                 ..Default::default()
             });
         }
