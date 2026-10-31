@@ -17,8 +17,10 @@ futures = "0.3"
 hyper-util = "0.1"
 # Pinned to the serde-saphyr migration until the next crates.io release.
 container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "32972e59702cf2ff5d9851bded87bcc1fd962e65" }
-# No crates.io release with Sysfs yet, so pinned to current main.
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca" }
+# No crates.io release yet; pinned to the commit that carries NVLink fabric
+# discovery (management ConnectX PFs) and the PCI address of the function
+# behind a cdev, which the nvswitch row relies on.
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "fb6f75e410cdf234f9a3959ef94bb2e30589eb6e" }
 prost = "0.14"
 serde-saphyr = { version = "2", default-features = false, features = ["serialize"] }
 tokio = { version = "1", features = ["full"] }
@@ -31,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "f6831fa878ec315ab477ccb88fbf8ec6cbd4cdca", features = ["testfs"] }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "fb6f75e410cdf234f9a3959ef94bb2e30589eb6e", features = ["testfs"] }
 serde_json = "1"
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 tempfile = "3"
