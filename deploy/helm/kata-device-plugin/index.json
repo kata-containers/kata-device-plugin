@@ -12,6 +12,12 @@
     "aliasResources": [
       {
         "name": "nvidia.com/gpu",
+        "pciClassPrefix": "0x0300",
+        "pciDeviceId": null,
+        "pciVendorId": "0x10de"
+      },
+      {
+        "name": "nvidia.com/gpu",
         "pciClassPrefix": "0x0302",
         "pciDeviceId": null,
         "pciVendorId": "0x10de"
