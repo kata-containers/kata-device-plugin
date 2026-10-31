@@ -59,6 +59,8 @@ spec:
             readOnlyRootFilesystem: true
             runAsUser: 0                    # kubelet socket ownership requires uid 0
             runAsNonRoot: false
+            seLinuxOptions:
+              type: container_device_plugin_t
             seccompProfile:
               type: RuntimeDefault
             capabilities:
