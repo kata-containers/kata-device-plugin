@@ -66,6 +66,12 @@ For each present resource the plugin:
    container runtime resolves them against the host CDI registry, and the
    Kata shim wires the cold-plugged VM devices to the right container.
 
+The kubelet forwards those CDI names to the container runtime only with
+`DevicePluginCDIDevices`, which is on in every supported Kubernetes release.
+On a kubelet without it the Kata VM still boots with the GPU, since the shim
+learns the device from the PodResources API, but the container inside sees
+no device.
+
 No config file, no Kubernetes API access, and a single flag,
 `--resource-naming=alias|sku`, which picks between the table names and
 hardware-identity names like `nvidia.com/GH100_H100_SXM5_80GB`. Everything
