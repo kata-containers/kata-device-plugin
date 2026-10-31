@@ -66,6 +66,12 @@ For each present resource the plugin:
    container runtime resolves them against the host CDI registry, and the
    Kata shim wires the cold-plugged VM devices to the right container.
 
+The kubelet forwards those CDI names to the container runtime only with
+`DevicePluginCDIDevices` enabled: on by default since Kubernetes 1.31, a
+feature gate before that (alpha in 1.28, beta in 1.29). On an older kubelet
+the Kata VM still boots with the GPU, since the shim learns the device from
+the PodResources API, but the container inside sees no device.
+
 No config file, no Kubernetes API access, and a single flag,
 `--resource-naming=alias|sku`, which picks between the table names and
 hardware-identity names like `nvidia.com/GH100_H100_SXM5_80GB`. Everything
@@ -164,8 +170,12 @@ The Static checks workflow runs this command on every pull request and fails
 if the committed files differ. The Release workflow checks them again before
 publishing.
 
-The DaemonSet mounts three host paths: the kubelet device-plugin socket
-directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
+The DaemonSet mounts four host paths: the kubelet device-plugin socket
+directory, `/dev/vfio` (read-only), `/var/run/cdi`, and
+`/var/run/kata-device-plugin` for the fabric view token and the host socket a
+publisher on the node uses. It exposes one hostPort, 9877, the fabric view
+service the Service VM's Fabric Manager client publishes to, token-gated (see
+ARCHITECTURE.md, "Fabric partitions"). It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
 root filesystem — root is required because the kubelet owns its socket
 directory and because PCI VPD, which identifies the NVSwitch management PFs,
