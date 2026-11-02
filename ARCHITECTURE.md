@@ -37,6 +37,12 @@ In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partition
 
 The view always wins; without one, the fabric's binding decides. The unit word travels in the view, so the owner of the fabric, the infrastructure or a colocation tenant, chooses it in their own Service VM pod spec.
 
+## Who may hold the fabric
+
+The fabric holder decides which GPUs share NVLink and publishes the view the node advertises. A tenant holding it can put its own GPUs and other tenants' into one partition, a cross-tenant data path, not a denial of service. The plugin cannot refuse a requester: the kubelet's Allocate names devices, not pods, and the plugin has no API access. A capacity of one is no protection either; a pending request wins the race when the Service VM restarts.
+
+The gate is admission. The chart ships a `ValidatingAdmissionPolicy` that denies `nvidia.com/nvswitch-fabric` in any pod outside the namespaces in `fabricOwnerNamespaces` (Kubernetes 1.30 or later). The same gate must cover the Service VM's runtime class where its hypervisor annotations are enabled: a tenant pod with `io.katacontainers.config.hypervisor.vsock_cid: "3"` takes the Service VM's CID and answers the host publisher in Fabric Manager's place. Tenants hold no verbs in the owner namespaces, so `kubectl exec` into the Service VM stays the owner's. In the colocation model the owner namespace is the tenant's own; the gate is the same.
+
 ## Out of scope: multi-node NVLink (IMEX)
 
 On GB200 NVL72 / GB300 / Vera Rubin, GPUs across nodes share memory over the NVLink fabric through the IMEX service. None of that concerns this plugin:

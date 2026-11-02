@@ -45,6 +45,12 @@ jobs:
           expected=$(jq -r '.image.repository + ":" + .image.defaultTag' "$chart/index.json")
           actual=$(helm template contract-check "$chart" | yq -r 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image')
           test "$actual" = "$expected"
+          fabric=$(jq -r '[.resourceNaming.aliasResources[] | select(.unit == "fabric") | .name] | unique | .[]' "$chart/index.json")
+          test "$(printf '%s\n' "$fabric" | wc -l)" = 1
+          grep -q "'$fabric' in" "$chart/templates/fabric-owner-policy.yaml"
+          owner=$(helm template owner-check "$chart" | yq -r 'select(.kind == "ValidatingAdmissionPolicyBinding") | .spec.matchResources.namespaceSelector.matchExpressions[0].values[0]')
+          test "$owner" = kata-system
+          test -z "$(helm template owner-check "$chart" --set fabricOwnerNamespaces=null | yq -r 'select(.kind == "ValidatingAdmissionPolicy") | .kind')"
           name() {
             helm template "$1" "$chart" "${@:2}" | yq -r 'select(.kind == "DaemonSet") | .metadata.name'
           }

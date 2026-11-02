@@ -40,3 +40,12 @@ resourceNaming: alias
 # tracing_subscriber EnvFilter, e.g. "kata_device_plugin=debug".
 # Empty uses the binary's built-in default (kata_device_plugin=info).
 logFilter: ""
+
+# Namespaces whose pods may request nvidia.com/nvswitch-fabric.  The fabric
+# holder decides which GPUs share NVLink and publishes the view the node
+# advertises, so it must be the fabric owner's Service VM and nothing else,
+# and the plugin cannot tell who requests a device.  A
+# ValidatingAdmissionPolicy (Kubernetes 1.30 or later) denies the request in
+# every other namespace.  Empty ships no policy.
+fabricOwnerNamespaces:
+  - kata-system
