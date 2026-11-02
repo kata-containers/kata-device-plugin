@@ -130,9 +130,10 @@ impl DeviceServer {
         Ok(envs)
     }
 
-    /// This server's devices under the current scan: the discover() group
-    /// matching our resolved name.
-    fn my_devices(&self) -> Vec<vfio::Device> {
+    /// This server's devices under the current scan, in the index order the
+    /// kubelet's IDs, the CDI spec's names and Allocate's bounds share; see
+    /// [`vfio::Units`].
+    fn my_devices(&self) -> vfio::Units {
         let view = self.view.as_ref().and_then(|view| view.current());
         vfio::discover(&self.device_dir, &self.sysfs, self.naming, view.as_ref())
             .remove(&self.name)
@@ -327,7 +328,7 @@ impl DevicePlugin for DeviceServer {
             // must retry next tick without re-sending an identical device
             // list every 5s (kubelet churn); a device change must reach the
             // kubelet even while the CDI registry is briefly unwritable.
-            let mut sent: Option<Vec<Vec<u32>>> = None;
+            let mut sent: Option<(Vec<Vec<u32>>, usize)> = None;
             let mut synced: Option<Vec<Vec<u32>>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
@@ -337,38 +338,49 @@ impl DevicePlugin for DeviceServer {
                     break;
                 }
 
-                let vfio_devs = server.my_devices();
+                let units = server.my_devices();
                 // Compare the backing cdev numbers per device, not the
                 // advertised Device list: IDs are just indices 0..n, so a
                 // same-count swap (vfio7 gone, vfio9 new) would look identical
                 // to the kubelet while the CDI spec's index → cdev mapping
-                // went stale.
-                let nums: Vec<Vec<u32>> = vfio_devs
+                // went stale.  Health is part of the key too: a partition
+                // Fabric Manager stops supporting keeps its cdevs.
+                let nums: Vec<Vec<u32>> = units
+                    .devices
                     .iter()
                     .map(|device| device.iter().map(|cdev| cdev.num).collect())
                     .collect();
-
-                if Some(&nums) != synced.as_ref() {
-                    match server.sync_cdi_spec(&vfio_devs).await {
-                        Ok(()) => synced = Some(nums.clone()),
+                // Only allocatable devices get CDI names; an unhealthy one is
+                // never handed out, and its member list may be partial.
+                let allocatable_nums = nums[..units.healthy].to_vec();
+                if Some(&allocatable_nums) != synced.as_ref() {
+                    match server.sync_cdi_spec(units.allocatable()).await {
+                        Ok(()) => synced = Some(allocatable_nums),
                         Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
                     }
                 }
 
-                if Some(&nums) != sent.as_ref() {
+                let key = (nums, units.healthy);
+                if Some(&key) != sent.as_ref() {
                     info!(
-                        count = nums.len(),
+                        count = key.0.len(),
+                        unhealthy = key.0.len() - units.healthy,
                         resource = %server.name,
                         "device list changed"
                     );
-                    let devices = (0..nums.len())
+                    let devices = (0..key.0.len())
                         .map(|idx| Device {
                             id: idx.to_string(),
-                            health: "Healthy".to_owned(),
+                            health: if idx < units.healthy {
+                                "Healthy"
+                            } else {
+                                "Unhealthy"
+                            }
+                            .to_owned(),
                             topology: None,
                         })
                         .collect();
-                    sent = Some(nums);
+                    sent = Some(key);
                     tokio::select! {
                         _ = server.endpoint_shutdown.cancelled() => break,
                         result = tx.send(Ok(ListAndWatchResponse { devices })) => {
@@ -408,13 +420,13 @@ impl DevicePlugin for DeviceServer {
         // The device set can shrink between scheduling and Allocate.  Check
         // the requested IDs against a fresh enumeration so a stale ID fails
         // loudly here instead of as an unresolvable CDI name in the shim.
-        let devs = self.my_devices();
-        let present = devs.len();
+        let units = self.my_devices();
+        let present = units.healthy;
         // The names below only work if the shim can resolve them at
         // SandboxCreate.  Sync the spec from the very enumeration we validate
         // against; if the CDI registry can't be written, fail the RPC now
         // instead of succeeding and producing an opaque runtime failure.
-        if let Err(e) = self.sync_cdi_spec(&devs).await {
+        if let Err(e) = self.sync_cdi_spec(units.allocatable()).await {
             return Err(Status::unavailable(format!(
                 "CDI registry for {resource_name} is not writable: {e:#}"
             )));
@@ -432,8 +444,8 @@ impl DevicePlugin for DeviceServer {
                     }),
                     _ => {
                         return Err(Status::not_found(format!(
-                            "device {id} of {resource_name} is no longer present \
-                             ({present} devices bound)"
+                            "device {id} of {resource_name} is not allocatable \
+                             ({present} healthy devices bound)"
                         )))
                     }
                 }
