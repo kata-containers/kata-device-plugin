@@ -14,7 +14,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use kata_device_plugin::view::{self, View, GRACE};
+use kata_device_plugin::view::{self, View};
 use pcilibs_rs::fabric::grpc::FabricViewServiceClient;
 use pcilibs_rs::fabric::v1::{self, FabricView};
 use pcilibs_rs::testfs::{add as add_dev, add_at};
@@ -84,20 +84,17 @@ pub async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<Channel> {
     DevicePluginClient::new(channel)
 }
 
-/// A view and the pieces that keep it current: the service it was published
-/// through and the publisher's still-open stream.
+/// A view and the service it was published through.
 pub struct Published {
     pub view: Arc<View>,
-    pub _tx: tokio::sync::mpsc::Sender<FabricView>,
     pub stop: CancellationToken,
     pub _state: TempDir,
 }
 
-/// Publish `fabric_view` the way fmclient does, over the host socket, and
-/// keep the stream open so the view stays current.
+/// Publish `fabric_view` the way fmclient does: one call over the host socket.
 pub async fn published(fabric_view: FabricView) -> Published {
     let state = TempDir::new().unwrap();
-    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let view = View::load(state.path()).unwrap();
     let socket = state.path().join("fabric-view.sock");
     let unix = UnixListener::bind(&socket).unwrap();
     let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -117,26 +114,16 @@ pub async fn published(fabric_view: FabricView) -> Published {
         }))
         .await
         .unwrap();
-    let (tx, rx) = tokio::sync::mpsc::channel::<FabricView>(2);
-    let mut client = FabricViewServiceClient::new(channel);
-    tokio::spawn(async move {
-        client
-            .publish(Request::new(tokio_stream::wrappers::ReceiverStream::new(
-                rx,
-            )))
-            .await
-    });
-    tx.send(fabric_view).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while view.current().is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the published view did not become current");
+    FabricViewServiceClient::new(channel)
+        .publish(Request::new(fabric_view))
+        .await
+        .unwrap();
+    assert!(
+        view.current().is_some(),
+        "the published view did not become current"
+    );
     Published {
         view,
-        _tx: tx,
         stop,
         _state: state,
     }

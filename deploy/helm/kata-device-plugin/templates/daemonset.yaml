@@ -90,8 +90,9 @@ spec:
               readOnly: true
             - name: cdi
               mountPath: /var/run/cdi
-            # The fabric view token and the host socket a publisher on the
-            # node uses; a pod restart keeps the token the Service VM holds.
+            # The fabric view token, the last view and the host socket a
+            # publisher on the node uses; a pod restart keeps the token the
+            # Service VM holds and the view the node advertises.
             - name: state
               mountPath: /var/run/kata-device-plugin
 

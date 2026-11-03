@@ -14,7 +14,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use kata_device_plugin::view::{View, GRACE};
+use kata_device_plugin::view::View;
 use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
 use pcilibs_rs::testfs::{add as add_dev, add_connectx};
 use tempfile::TempDir;
@@ -150,7 +150,7 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     }
     add_dev(vfio.path(), 2, 0x10de, 0x2330, 0x030200);
     let state = TempDir::new().unwrap();
-    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let view = View::load(state.path()).unwrap();
     let before = view.token();
     let sockets = TempDir::new().unwrap();
 
@@ -214,7 +214,7 @@ async fn a_failed_or_empty_allocate_keeps_the_holders_token() {
         add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
     }
     let state = TempDir::new().unwrap();
-    let view = View::with_grace(state.path(), GRACE).unwrap();
+    let view = View::load(state.path()).unwrap();
     let sockets = TempDir::new().unwrap();
     let (stop, server) =
         server_with_view("nvidia.com/nvswitch-fabric", &vfio, &sockets, &view, None).await;
