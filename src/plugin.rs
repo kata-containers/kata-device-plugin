@@ -245,8 +245,8 @@ impl DeviceServer {
     /// scan, or remove it when no devices remain.  Sync fs work runs off the
     /// async workers.  Callers decide the failure policy: the poller retries
     /// on the next tick, Allocate fails the RPC.
-    async fn sync_cdi_spec(&self, devs: &[vfio::Device]) -> anyhow::Result<()> {
-        if devs.is_empty() {
+    async fn sync_cdi_spec(&self, units: &[vfio::Entry]) -> anyhow::Result<()> {
+        if units.is_empty() {
             let cdi_file = cdi::spec_path(&self.cdi_dir, &self.name);
             match tokio::fs::remove_file(&cdi_file).await {
                 Ok(()) => Ok(()),
@@ -255,9 +255,9 @@ impl DeviceServer {
             }
         } else {
             let name = self.name.clone();
-            let devs = devs.to_vec();
+            let units = units.to_vec();
             let dir = self.cdi_dir.clone();
-            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(&name, &devs, &dir))
+            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(&name, &units, &dir))
                 .await
                 .context("CDI spec write task")?
         }
@@ -328,8 +328,8 @@ impl DevicePlugin for DeviceServer {
             // must retry next tick without re-sending an identical device
             // list every 5s (kubelet churn); a device change must reach the
             // kubelet even while the CDI registry is briefly unwritable.
-            let mut sent: Option<(Vec<Vec<u32>>, usize)> = None;
-            let mut synced: Option<Vec<Vec<u32>>> = None;
+            let mut sent: Option<(Vec<(String, Vec<u32>)>, usize)> = None;
+            let mut synced: Option<Vec<(String, Vec<u32>)>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
                 // set never changes again — otherwise this task would poll
@@ -339,28 +339,32 @@ impl DevicePlugin for DeviceServer {
                 }
 
                 let units = server.my_devices();
-                // Compare the backing cdev numbers per device, not the
-                // advertised Device list: IDs are just indices 0..n, so a
-                // same-count swap (vfio7 gone, vfio9 new) would look identical
-                // to the kubelet while the CDI spec's index → cdev mapping
-                // went stale.  Health is part of the key too: a partition
-                // Fabric Manager stops supporting keeps its cdevs.
-                let nums: Vec<Vec<u32>> = units
-                    .devices
+                // The key is every device's ID with the cdev numbers behind
+                // it: an ID names a slot or a partition and stays while the
+                // functions under it change (vfio7 gone, vfio9 new), and the
+                // CDI spec must follow those.  Health is part of the key too:
+                // a partition Fabric Manager stops supporting keeps its cdevs.
+                let key: Vec<(String, Vec<u32>)> = units
+                    .entries
                     .iter()
-                    .map(|device| device.iter().map(|cdev| cdev.num).collect())
+                    .map(|unit| {
+                        (
+                            unit.id.clone(),
+                            unit.device.iter().map(|cdev| cdev.num).collect(),
+                        )
+                    })
                     .collect();
                 // Only allocatable devices get CDI names; an unhealthy one is
                 // never handed out, and its member list may be partial.
-                let allocatable_nums = nums[..units.healthy].to_vec();
-                if Some(&allocatable_nums) != synced.as_ref() {
+                let allocatable = key[..units.healthy].to_vec();
+                if Some(&allocatable) != synced.as_ref() {
                     match server.sync_cdi_spec(units.allocatable()).await {
-                        Ok(()) => synced = Some(allocatable_nums),
+                        Ok(()) => synced = Some(allocatable),
                         Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
                     }
                 }
 
-                let key = (nums, units.healthy);
+                let key = (key, units.healthy);
                 if Some(&key) != sent.as_ref() {
                     info!(
                         count = key.0.len(),
@@ -368,9 +372,12 @@ impl DevicePlugin for DeviceServer {
                         resource = %server.name,
                         "device list changed"
                     );
-                    let devices = (0..key.0.len())
-                        .map(|idx| Device {
-                            id: idx.to_string(),
+                    let devices = units
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, unit)| Device {
+                            id: unit.id.clone(),
                             health: if idx < units.healthy {
                                 "Healthy"
                             } else {
@@ -438,16 +445,15 @@ impl DevicePlugin for DeviceServer {
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();
             for id in cr.devices_i_ds {
-                match id.parse::<usize>() {
-                    Ok(idx) if idx < present => cdi_devices.push(CdiDevice {
+                if units.allocatable().iter().any(|unit| unit.id == id) {
+                    cdi_devices.push(CdiDevice {
                         name: format!("{resource_name}={id}"),
-                    }),
-                    _ => {
-                        return Err(Status::not_found(format!(
-                            "device {id} of {resource_name} is not allocatable \
-                             ({present} healthy devices bound)"
-                        )))
-                    }
+                    });
+                } else {
+                    return Err(Status::not_found(format!(
+                        "device {id} of {resource_name} is not allocatable \
+                         ({present} healthy devices bound)"
+                    )));
                 }
             }
             allocations.push(cdi_devices);
