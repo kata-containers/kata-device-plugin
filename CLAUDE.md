@@ -4,7 +4,7 @@ Rust. No Go. No exceptions.
 
 ## What this is
 
-A Kubernetes device plugin DaemonSet that enumerates the node's VFIO-bound passthrough devices and declares them to the kubelet. Read-only toward the infrastructure — it only declares what exists, never binds or reconfigures anything (ADR 1000, boundary doc). It talks only to the kubelet over unix sockets; it has no Kubernetes API access.
+A Kubernetes device plugin DaemonSet that enumerates the node's VFIO-bound passthrough devices and declares them to the kubelet. Read-only toward the infrastructure — it only declares what exists, never binds or reconfigures anything (ADR 1000, boundary doc). It talks to the kubelet over unix sockets and hosts the fabric view service, fed only by the node's Service VM; it has no Kubernetes API access.
 
 ## Project layout
 
@@ -12,7 +12,8 @@ A Kubernetes device plugin DaemonSet that enumerates the node's VFIO-bound passt
 src/
   main.rs      entry point: start one DeviceServer per present resource, wait for shutdown
   plugin.rs    DeviceServer (tonic gRPC impl) + socket/CDI-dir constants
-  vfio.rs      IOMMUFD cdev enumeration + the RESOURCES table (PCI identity → resource name)
+  vfio.rs      IOMMUFD cdev enumeration + the RESOURCES table (PCI identity → resource name); partition units from the view
+  view.rs      the fabric view service the Service VM's Fabric Manager client publishes to, and its token
   cdi.rs       host-side CDI spec writer (read by the Kata shim)
 proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
@@ -26,13 +27,15 @@ deploy/
 - **KISS** — fewer files, fewer abstractions. No trait objects, no dynamic dispatch, no registry pattern, no config file. Exactly one CLI flag, `--resource-naming=alias|sku`, because an argument templates directly in the DaemonSet spec; everything else the plugin needs is a kernel, kubelet, or CDI contract expressed as a constant. The device set is dynamic: ListAndWatch polls, and servers for newly appearing resource names are spawned at runtime — no pod restart on device-set changes.
 - **No privileged pods** — the DaemonSet mounts `/dev/vfio` read-only and `/var/lib/kubelet/device-plugins` for the kubelet socket. Nothing else. Isolation is the VM boundary (ADR 10000).
 - **No reconfiguration, no platform knowledge** — VFIO binding happens on the trusted side. The plugin's whole interface is `/dev/vfio/devices/vfio*`: whatever is bound gets consumed. Each cdev is matched against the `RESOURCES` table in `src/vfio.rs` — one row per PCI face of a resource: (name, PCI vendor, optional PCI device, PCI class prefix), read from `/sys/class/vfio-dev/vfioN/device`. Fabric rows admit a cdev only when pcilibs-rs's topology scan names its function, which is how the HGX B200/B300 management PFs are told from the node's data-path ConnectX NICs that share their PCI identity. A resource is advertised iff matching devices are present; unmatched devices are ignored. Supporting a new device type is one table row — no other code changes. Each row declares its unit: one advertised device per PCI device (every bound function, one CDI entry), or one per node for the NVSwitch fabric, advertised only when every switch function on the node is bound. Functions are never separate devices. IOMMUFD only — no legacy VFIO group backend. All paths are kernel contracts, not configuration.
-- **Supply, not demand** — the plugin declares what exists; how it is consumed is the scheduling layer's decision. Whole node vs subset (`nvidia.com/gpu: 4` vs `nvidia.com/gpu: 2`), exclusive tenancy, tray semantics: all of that is expressed in pod specs, node labels, and taints, never encoded here. No aggregate resources, no consumption modes (see ARCHITECTURE.md).
+- **Supply, not demand** — the plugin declares what exists; how it is consumed is the scheduling layer's decision. Whole node vs subset (`nvidia.com/gpu: 4` vs `nvidia.com/gpu: 2`), exclusive tenancy, tray semantics: all of that is expressed in pod specs, node labels, and taints, never encoded here. No aggregate resources, no consumption modes (see ARCHITECTURE.md). Who may request the fabric is admission policy, shipped by the chart as a `ValidatingAdmissionPolicy` over `fabricOwnerNamespaces`, because Allocate names no pod.
 
 ## Resource name
 
 The plugin advertises `nvidia.com/gpu` — the same name the standard NVIDIA device plugin would use.  This is intentional: trusted and untrusted workloads never share a cluster, so on a Kata/untrusted cluster nothing else exposes `nvidia.com/gpu`.  A clash means two device plugins are running on the same node, which is a misconfiguration that should be detected loudly.  The names live in the `RESOURCES` table in `src/vfio.rs`, not configuration.
 
 `nvidia.com/nvswitch-fabric` is the node's whole NVSwitch fabric as one device: the four switch chips on H100/H200, the management ConnectX PFs on B200/B300, which NVIDIA's HGX guide calls the representation of the NVSwitches. Its only consumer is the Service VM running Fabric Manager, which takes all of it, so a Service VM pod requests `nvidia.com/nvswitch-fabric: 1` on every platform. Fabric rows keep this alias in SKU mode, since one function's SKU would misname a fabric.
+
+In shared NVSwitch mode the Service VM's Fabric Manager client publishes the partition view to the plugin (`src/view.rs`), and each active, supported, exclusive and complete partition is one device named by size, `nvidia.com/nvlink-4gpu`; a single-GPU partition is a plain `nvidia.com/gpu`. Physical IDs resolve through the firmware slot label on the PCI function. A bound fabric without a view advertises no GPU; a view with unit `gpu` advertises one device per GPU. See ARCHITECTURE.md, "Fabric partitions".
 
 With `--resource-naming=sku` the advertised names carry the hardware identity instead, the way the kubevirt GPU device plugin names passthrough devices: the PCI device id is resolved against the `pci-ids` database and sanitized, e.g. `nvidia.com/GH100_H100_SXM5_80GB` for 10de:2330.  Unknown ids fall back to the matching table row's name.  Curated alias rows (exact device id, placed above their class fallback) work in both modes.
 

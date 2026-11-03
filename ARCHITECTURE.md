@@ -6,7 +6,7 @@ This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passt
 
 A clash with another plugin advertising `nvidia.com/gpu` is intentional and detects misconfiguration: trusted and untrusted workloads do not share a cluster, so on a Kata/untrusted cluster nothing else exposes this resource.
 
-The plugin talks only to the kubelet, over unix sockets. It has no Kubernetes API access, no RBAC, and no modes — behaviour is identical on every platform.
+The plugin talks to the kubelet over unix sockets and hosts one more endpoint, the fabric view service described below, which only the node's Service VM can feed. It has no Kubernetes API access and no RBAC. Behaviour is identical on every platform; what differs per node is what the fabric owner publishes.
 
 ## Supported platforms
 
@@ -17,6 +17,31 @@ GPUs (and NVSwitches, where the platform has them) are passed through to Kata VM
 ## Service VM
 
 NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests `nvidia.com/nvswitch-fabric: 1`, the same on every platform. On HGX H100/H200 that one device holds the four NVSwitch chips. On HGX B200/B300 it holds the management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together; telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads, and the plugin stays a sysfs reader and binds nothing. The fabric is advertised only once every switch function on the node is bound, so a Service VM never starts with part of one. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image and one pod spec serve both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
+
+## Fabric partitions
+
+In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partitions, and a tenant VM must receive exactly one active partition's GPUs: GPUs that share an active partition reach each other over NVLink, so this is isolation, not convenience. Fabric Manager names a GPU by its physical ID, the module slot on the baseboard, never by PCI address; the host names it by PCI address. The plugin bridges the two through the firmware's slot label on the PCI function (`/sys/bus/pci/devices/<bdf>/label`, "GPU0, SMX7" on DGX systems), verified against Fabric Manager's own records on a DGX NVL8; a GPU without a parsable label resolves to no partition, so an unknown board advertises nothing rather than a wrong partition. The shared schema and the resolution live in pcilibs-rs (`fabric`), used by the plugin and by the Fabric Manager client that publishes.
+
+**The view.** The plugin cannot read Fabric Manager, by design. The Fabric Manager client publishes the partition lists to the plugin's view service in one gRPC call, and the plugin keeps that view, on disk next to the token so a plugin restart keeps the node's capacity, until the next call or until the fabric changes hands. Only the fabric holder may publish: the fabric's Allocate injects an endpoint and a freshly minted token into that container's environment, the TCP listener admits only that token, and a unix socket on the host admits a publisher there without one, its permissions being the credential. A new holder's Allocate withdraws the view, since the partitions it described were the previous holder's. The plugin is a scheduling ledger and Fabric Manager is the enforcement point: a stale view sends a pod to GPUs whose fabric is not ready, where CUDA init fails, and cannot hand out another partition's GPUs. So the command that changes partitions publishes the result and exits; nothing stays connected.
+
+**The unit.** An active partition is advertised as its own extended resource named by size, `nvidia.com/nvlink-4gpu`, one device holding every function of every member GPU. A count under `nvidia.com/gpu` was rejected for partitions because it is ambiguous, four NVLinked GPUs read the same as four standalone ones, and only a per-shape ledger lets the scheduler see how many partitions remain. This is not the aggregate the plugin refuses to invent below: the fabric owner defines the partition in the Service VM and it has exactly one valid consumption shape. A single-GPU partition is a plain `nvidia.com/gpu`. A partition is advertised only when active, supported by Fabric Manager, exclusive (no other active partition names one of its GPUs) and complete (every member bound and labeled on this host).
+
+**What the node advertises.**
+
+| node | view | unit | GPUs |
+| --- | --- | --- | --- |
+| fabric not VFIO-bound (host Fabric Manager, or no fabric) | none | | one device each, as before |
+| fabric VFIO-bound (a Service VM owns it) | none | | none, until the Service VM publishes |
+| any | present | `partition` or unset | one device per advertisable partition |
+| any | present | `gpu` | one device each: the owner holds the whole node and says so |
+
+The view always wins; without one, the fabric's binding decides. The unit word travels in the view, so the owner of the fabric, the infrastructure or a colocation tenant, chooses it in their own Service VM pod spec.
+
+## Who may hold the fabric
+
+The fabric holder decides which GPUs share NVLink and publishes the view the node advertises. A tenant holding it can put its own GPUs and other tenants' into one partition, a cross-tenant data path, not a denial of service. The plugin cannot refuse a requester: the kubelet's Allocate names devices, not pods, and the plugin has no API access. A capacity of one is no protection either; a pending request wins the race when the Service VM restarts.
+
+The gate is admission. The chart ships a `ValidatingAdmissionPolicy` that denies `nvidia.com/nvswitch-fabric` in any pod outside the namespaces in `fabricOwnerNamespaces` (Kubernetes 1.30 or later). The same gate must cover the Service VM's runtime class where its hypervisor annotations are enabled: a tenant pod with `io.katacontainers.config.hypervisor.vsock_cid: "3"` takes the Service VM's CID and answers the host publisher in Fabric Manager's place. Tenants hold no verbs in the owner namespaces, so `kubectl exec` into the Service VM stays the owner's. In the colocation model the owner namespace is the tenant's own; the gate is the same.
 
 ## Out of scope: multi-node NVLink (IMEX)
 

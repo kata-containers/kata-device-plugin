@@ -3,6 +3,7 @@
 pub mod cdi;
 pub mod plugin;
 pub mod vfio;
+pub mod view;
 
 pub mod dp {
     pub mod v1beta1 {

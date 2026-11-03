@@ -1,0 +1,58 @@
+{{- /*
+Who may hold the fabric is decided here, in admission, not in the plugin:
+the kubelet's Allocate names devices, not pods, so the plugin cannot refuse
+a requester (ARCHITECTURE.md, "Who may hold the fabric").  The resource name
+is the fabric row of the RESOURCES table, the same in both naming modes; the
+Static checks workflow holds it equal to index.json.
+*/}}
+{{- with .Values.fabricOwnerNamespaces }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "kata-device-plugin.fullname" $ }}-fabric-owner
+  labels:
+    app.kubernetes.io/name: kata-device-plugin
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    {{- /* Extended resources appear under limits, requests or both, and a
+           missing field is an error in CEL, hence the has() guards.  Init
+           containers can request them too; ephemeral containers cannot.  Two
+           validations rather than one over a concatenated list: CEL cannot
+           add the two container lists, their schema types differ.  dyn():
+           the policy controller's type checker cannot model the
+           Quantity-valued maps of ResourceRequirements and would report
+           `undefined field 'limits'`; evaluation is unaffected either way. */}}
+    {{- $holds := "has(c.resources) && ((has(dyn(c.resources).limits) && 'nvidia.com/nvswitch-fabric' in dyn(c.resources).limits) || (has(dyn(c.resources).requests) && 'nvidia.com/nvswitch-fabric' in dyn(c.resources).requests))" }}
+    {{- $message := "nvidia.com/nvswitch-fabric may only be requested from a fabric owner namespace (chart value fabricOwnerNamespaces)" }}
+    - expression: {{ printf "!object.spec.containers.exists(c, %s)" $holds | quote }}
+      message: {{ $message | quote }}
+    - expression: {{ printf "!has(object.spec.initContainers) || !object.spec.initContainers.exists(c, %s)" $holds | quote }}
+      message: {{ $message | quote }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "kata-device-plugin.fullname" $ }}-fabric-owner
+  labels:
+    app.kubernetes.io/name: kata-device-plugin
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+spec:
+  policyName: {{ include "kata-device-plugin.fullname" $ }}-fabric-owner
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson . }}
+{{- end }}

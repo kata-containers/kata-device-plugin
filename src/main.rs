@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use kata_device_plugin::{plugin, vfio};
+use kata_device_plugin::{plugin, vfio, view};
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -30,12 +30,14 @@ fn parse_naming() -> anyhow::Result<vfio::Naming> {
 fn spawn_server(
     name: &str,
     naming: vfio::Naming,
+    view: Option<&Arc<view::View>>,
+    advertise: &Option<String>,
     shutdown: &CancellationToken,
     running: &Arc<Mutex<HashSet<String>>>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     info!(resource = %name, "starting plugin");
-    let server = DeviceServer::new(
+    let mut server = DeviceServer::new(
         name,
         naming,
         vfio::VFIO_DIR,
@@ -43,6 +45,9 @@ fn spawn_server(
         plugin::SOCKET_DIR,
         plugin::CDI_DIR,
     );
+    if let Some(view) = view {
+        server = server.with_view(view.clone(), advertise.clone());
+    }
     let token = shutdown.clone();
     let label = name.to_owned();
     let set = running.clone();
@@ -83,6 +88,41 @@ async fn main() -> anyhow::Result<()> {
     let running: Arc<Mutex<HashSet<String>>> = Arc::default();
     let mut tasks = Vec::new();
 
+    // The fabric view service.  A fabric node without it has no view and
+    // fails closed; a GPU-only node does not need it.  So neither its state
+    // directory nor its listeners are fatal: the device servers below run
+    // either way.
+    let view = match view::View::load(Path::new(view::STATE_DIR)) {
+        Ok(view) => Some(view),
+        Err(e) => {
+            tracing::warn!("fabric view service disabled: {e:#}");
+            None
+        }
+    };
+    let advertise = std::env::var(view::HOST_IP_ENV)
+        .ok()
+        .and_then(|ip| view::endpoint(&ip));
+    if advertise.is_none() {
+        tracing::warn!(
+            "{} is unset or not an IP address: the fabric holder gets a token but no endpoint",
+            view::HOST_IP_ENV
+        );
+    }
+    if let Some(view) = &view {
+        match view::bind(Path::new(view::SOCKET)).await {
+            Ok((unix, tcp)) => {
+                let view = view.clone();
+                let token = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = view::serve(view, unix, tcp, token).await {
+                        tracing::warn!("fabric view service: {e:#}");
+                    }
+                }));
+            }
+            Err(e) => tracing::warn!("fabric view service not started: {e:#}"),
+        }
+    }
+
     // Reconcile loop: spawn a server for every name that should exist but
     // has none running.  Alias row names are always desired so the kubelet
     // sees the resource (zero capacity included) regardless of deployment
@@ -90,10 +130,12 @@ async fn main() -> anyhow::Result<()> {
     // are never stopped — a name whose devices vanish keeps advertising
     // zero capacity via its own ListAndWatch poller.
     loop {
+        let current = view.as_ref().and_then(|view| view.current());
         let mut desired: Vec<String> = vfio::discover(
             Path::new(vfio::VFIO_DIR),
             &vfio::Sysfs::new(Path::new(vfio::SYSFS_ROOT)),
             naming,
+            current.as_ref(),
         )
         .into_keys()
         .collect();
@@ -102,7 +144,15 @@ async fn main() -> anyhow::Result<()> {
         }
         for name in desired {
             if !running.lock().unwrap().contains(&name) {
-                spawn_server(&name, naming, &shutdown, &running, &mut tasks);
+                spawn_server(
+                    &name,
+                    naming,
+                    view.as_ref(),
+                    &advertise,
+                    &shutdown,
+                    &running,
+                    &mut tasks,
+                );
             }
         }
         tokio::select! {
