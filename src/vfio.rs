@@ -994,6 +994,16 @@ mod tests {
         let r = root.path();
         testfs::add_gpu(r, 42);
         testfs::add_gpu(r, 7);
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:07:00", "0000:2a:00"]);
+        std::fs::remove_file(r.join("devices/vfio7")).unwrap();
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:2a:00"]);
+
+        // A bound fabric without a view advertises no GPU, so the fabric is
+        // checked on its own.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
         for function in 0..4u32 {
             testfs::add_connectx(
                 r,
@@ -1003,11 +1013,7 @@ mod tests {
             );
         }
         let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
-        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:07:00", "0000:2a:00"]);
         assert_eq!(ids(&units["nvidia.com/nvswitch-fabric"]), ["0000:05:00"]);
-        std::fs::remove_file(r.join("devices/vfio7")).unwrap();
-        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
-        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:2a:00"]);
     }
 
     #[test]
