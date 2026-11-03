@@ -311,3 +311,57 @@ async fn active_partitions_are_served_as_nvlink_units() {
     node.shutdown().await;
     owner.stop.cancel();
 }
+
+#[tokio::test]
+async fn an_incomplete_partition_is_served_unhealthy() {
+    // GPU 6 is not on this host, so pair 6 is Unhealthy after the healthy
+    // pair 7: the kubelet counts it in capacity and not in allocatable, the
+    // CDI spec names only the healthy unit, and Allocate refuses its ID.
+    let vfio = TempDir::new().unwrap();
+    for (n, address, module) in [
+        (0, "0000:1a:00.0", 7),
+        (2, "0000:62:00.0", 8),
+        (3, "0000:73:00.0", 5),
+    ] {
+        add_labeled_gpu(vfio.path(), n, address, module);
+    }
+    for n in 4..8u32 {
+        add_dev(vfio.path(), n, 0x10de, 0x22a3, 0x068000);
+    }
+    let pairs: &[(u32, bool, &[u32])] = &[(6, true, &[5, 6]), (7, true, &[7, 8])];
+    let owner = published(fabric_view("partition", pairs)).await;
+    let node = Node::start_with_view(
+        vfio,
+        &["nvidia.com/nvlink-2gpu", "nvidia.com/nvswitch-fabric"],
+        Naming::Alias,
+        Some(owner.view.clone()),
+    )
+    .await;
+
+    let (_units, units) = node.snapshot("kata-nvlink-2gpu.sock").await;
+    let health: Vec<(&str, &str)> = units
+        .devices
+        .iter()
+        .map(|d| (d.id.as_str(), d.health.as_str()))
+        .collect();
+    assert_eq!(health, [("0", "Healthy"), ("1", "Unhealthy")]);
+
+    let spec: Spec =
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvlink-2gpu.yaml").unwrap()).unwrap();
+    assert_eq!(spec.devices.len(), 1);
+
+    let err = node
+        .client("kata-nvlink-2gpu.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["1".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    node.shutdown().await;
+    owner.stop.cancel();
+}

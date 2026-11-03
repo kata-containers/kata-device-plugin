@@ -158,7 +158,7 @@ pub fn discover(
     sysfs: &Sysfs,
     naming: Naming,
     view: Option<&FabricView>,
-) -> BTreeMap<String, Vec<Device>> {
+) -> BTreeMap<String, Units> {
     // Name, then PCI slot, then the slot's bound functions.  No row has a
     // multi-function PCI device today; the slot is the principle
     // ARCHITECTURE.md states, functions are never separate devices, and the
@@ -241,14 +241,42 @@ pub fn discover(
         None => by_slot(gpus),
     };
     pci.into_iter()
-        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .map(|(name, devices)| (name, Units::from(devices.into_values().collect::<Vec<_>>())))
         .chain(gpu_units)
         .chain(
             fabrics
                 .into_iter()
-                .map(|(name, device)| (name, vec![device])),
+                .map(|(name, device)| (name, Units::from(vec![device]))),
         )
         .collect()
+}
+
+/// The devices advertised under one resource name, in the kubelet's ID
+/// order.  `devices[..healthy]` are the units, allocatable and named in the
+/// CDI spec; the rest are active partitions that are not units, advertised
+/// Unhealthy so the kubelet counts them in capacity and leaves them out of
+/// allocatable: the partition the Service VM activated stays visible on the
+/// node while nothing can be scheduled on it.
+#[derive(Debug, Default)]
+pub struct Units {
+    pub devices: Vec<Device>,
+    pub healthy: usize,
+}
+
+impl Units {
+    pub fn allocatable(&self) -> &[Device] {
+        &self.devices[..self.healthy]
+    }
+}
+
+/// Every device a unit.
+impl From<Vec<Device>> for Units {
+    fn from(devices: Vec<Device>) -> Self {
+        Self {
+            healthy: devices.len(),
+            devices,
+        }
+    }
 }
 
 /// PCI class of a 3D controller: the rows whose devices a partition view
@@ -257,9 +285,9 @@ const GPU_CLASS: u16 = 0x0302;
 
 /// One advertised device per GPU, in PCI order: the unit when nothing says
 /// how GPUs relate to each other.
-fn by_slot(gpus: BTreeMap<String, BTreeMap<String, Device>>) -> BTreeMap<String, Vec<Device>> {
+fn by_slot(gpus: BTreeMap<String, BTreeMap<String, Device>>) -> BTreeMap<String, Units> {
     gpus.into_iter()
-        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .map(|(name, devices)| (name, Units::from(devices.into_values().collect::<Vec<_>>())))
         .collect()
 }
 
@@ -282,7 +310,7 @@ fn partition_units(
     view: &FabricView,
     sysfs: &Sysfs,
     gpus: BTreeMap<String, BTreeMap<String, Device>>,
-) -> BTreeMap<String, Vec<Device>> {
+) -> BTreeMap<String, Units> {
     // Every bound GPU by PCI slot, with the name its row resolved to.
     let bound: BTreeMap<String, (String, Device)> = gpus
         .iter()
@@ -316,27 +344,27 @@ fn partition_units(
     if resolved.unit == fabric::Unit::Gpu {
         return by_slot(gpus);
     }
-    let mut units: BTreeMap<String, Vec<Device>> = BTreeMap::new();
-    let mut withheld: Vec<String> = Vec::new();
+    let mut units: BTreeMap<String, Units> = BTreeMap::new();
+    let mut reasons: Vec<String> = Vec::new();
     for partition in resolved.partitions.iter().filter(|p| p.active) {
-        if !partition.advertisable() {
-            let why = if !partition.supported {
-                "unsupported"
-            } else if !partition.exclusive {
-                "shares a GPU with another active partition"
-            } else {
-                "not every GPU is bound and labeled here"
-            };
-            withheld.push(format!("{}: {why}", partition.id));
-            continue;
-        }
-        // `bdfs()` are the functions passed in above, so every slot is here.
+        // The members this host has; `bdfs()` are functions passed in above,
+        // so every one of them is bound.  A unit has all of them.
         let members: Vec<&(String, Device)> = partition
             .bdfs()
             .filter_map(|bdf| bound.get(pcilibs_rs::slot(bdf)))
             .collect();
-        let size = members.len();
-        let (row_name, _) = members[0];
+        // Named by the size Fabric Manager gave the partition, so an
+        // incomplete eight-GPU partition reads as the eight-GPU resource.
+        // With no member bound here there is nothing to advertise and no row
+        // to name it by.
+        let Some((row_name, _)) = members.first() else {
+            reasons.push(format!(
+                "{}: no member bound here, not advertised",
+                partition.id
+            ));
+            continue;
+        };
+        let size = partition.members.len();
         let name = if size == 1 {
             row_name.clone()
         } else {
@@ -347,10 +375,24 @@ fn partition_units(
             .iter()
             .flat_map(|(_, device)| device.iter().cloned())
             .collect();
-        units.entry(name).or_default().push(device);
+        let entry = units.entry(name).or_default();
+        if partition.advertisable() {
+            entry.devices.insert(entry.healthy, device);
+            entry.healthy += 1;
+        } else {
+            let why = if !partition.supported {
+                "unsupported"
+            } else if !partition.exclusive {
+                "shares a GPU with another active partition"
+            } else {
+                "not every GPU is bound and labeled here"
+            };
+            reasons.push(format!("{}: Unhealthy, {why}", partition.id));
+            entry.devices.push(device);
+        }
     }
-    if !withheld.is_empty() {
-        tracing::warn!(?withheld, "active partitions not advertised");
+    if !reasons.is_empty() {
+        tracing::warn!(partitions = ?reasons, "active partitions that are not units");
     }
     units
 }
@@ -447,6 +489,25 @@ pub(crate) mod testfs {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The units only, which is what every test below but the unhealthy one
+    /// looks at.
+    fn discover(
+        vfio_dir: &Path,
+        sysfs: &Sysfs,
+        naming: Naming,
+        view: Option<&FabricView>,
+    ) -> BTreeMap<String, Vec<Device>> {
+        super::discover(vfio_dir, sysfs, naming, view)
+            .into_iter()
+            .filter(|(_, units)| units.healthy > 0)
+            .map(|(name, units)| (name, units.allocatable().to_vec()))
+            .collect()
+    }
+
+    fn unhealthy(units: &Units) -> &[Device] {
+        &units.devices[units.healthy..]
+    }
 
     /// Cdev numbers per advertised device.
     fn nums(devices: &[Device]) -> Vec<Vec<u32>> {
@@ -829,22 +890,26 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_unsupported_and_overlapping_partitions_are_withheld() {
+    fn incomplete_unsupported_and_overlapping_partitions_are_unhealthy() {
         let root = TempDir::new().unwrap();
         let r = root.path();
         four_labeled_gpus(r);
-        // GPU 6 (cdev 1) is present but no longer bound: its pair is out, the
-        // other pair stands.
+        // GPU 6 (cdev 1) is present but no longer bound: its pair is an
+        // unhealthy device holding the member that is here, under the name
+        // of the size Fabric Manager gave it; the other pair stands.
         std::fs::remove_file(r.join("devices/vfio1")).unwrap();
-        let map = discover(
+        let units = super::discover(
             r,
             &Sysfs::new(r),
             Naming::Alias,
             Some(&view("partition", PAIRS)),
         );
-        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![0, 2]]);
+        let pairs = &units["nvidia.com/nvlink-2gpu"];
+        assert_eq!(nums(pairs.allocatable()), vec![vec![0, 2]]);
+        assert_eq!(nums(unhealthy(pairs)), vec![vec![3]]);
 
-        // Fabric Manager lists pair 7 as unsupported: out as well.
+        // Fabric Manager lists pair 7 as unsupported: unhealthy as well, with
+        // both members, so nothing is allocatable.
         let mut unsupported = view("partition", PAIRS);
         unsupported.unsupported = Some(v1::UnsupportedPartitionList {
             version: 1,
@@ -853,20 +918,32 @@ mod tests {
                 gpu_physical_ids: vec![7, 8],
             }],
         });
-        assert!(discover(r, &Sysfs::new(r), Naming::Alias, Some(&unsupported)).is_empty());
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, Some(&unsupported));
+        let pairs = &units["nvidia.com/nvlink-2gpu"];
+        assert_eq!(pairs.healthy, 0);
+        assert_eq!(nums(unhealthy(pairs)), vec![vec![3], vec![0, 2]]);
 
-        // Two active partitions naming GPU 7: neither is a unit.
+        // Two active partitions naming GPU 7: neither is a unit, both are
+        // unhealthy, the single under the plain GPU name.
         std::fs::write(r.join("devices/vfio1"), b"").unwrap();
         let overlap: &[(u32, bool, &[u32])] =
             &[(7, true, &[7, 8]), (14, true, &[7]), (6, true, &[5, 6])];
-        let map = discover(
+        let units = super::discover(
             r,
             &Sysfs::new(r),
             Naming::Alias,
             Some(&view("partition", overlap)),
         );
-        assert_eq!(map.keys().collect::<Vec<_>>(), ["nvidia.com/nvlink-2gpu"]);
-        assert_eq!(nums(&map["nvidia.com/nvlink-2gpu"]), vec![vec![3, 1]]);
+        assert_eq!(
+            units.keys().collect::<Vec<_>>(),
+            ["nvidia.com/gpu", "nvidia.com/nvlink-2gpu"]
+        );
+        let pairs = &units["nvidia.com/nvlink-2gpu"];
+        assert_eq!(nums(pairs.allocatable()), vec![vec![3, 1]]);
+        assert_eq!(nums(unhealthy(pairs)), vec![vec![0, 2]]);
+        let single = &units["nvidia.com/gpu"];
+        assert_eq!(single.healthy, 0);
+        assert_eq!(nums(unhealthy(single)), vec![vec![0]]);
     }
 
     #[test]

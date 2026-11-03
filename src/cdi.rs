@@ -101,6 +101,7 @@ mod tests {
         vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/gpu")
             .unwrap_or_default()
+            .devices
     }
 
     #[test]
@@ -186,7 +187,8 @@ mod tests {
         }
         let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/nvswitch-fabric")
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .devices;
 
         write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
 
@@ -212,7 +214,8 @@ mod tests {
         }
         let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/nvswitch-fabric")
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .devices;
 
         write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
 
