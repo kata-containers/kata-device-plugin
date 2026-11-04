@@ -3,7 +3,7 @@ TAG   ?= latest
 # Commit of this build, with -dirty when the tree has uncommitted changes.
 GIT_SHA := $(shell git rev-parse --short HEAD)$(shell git diff-index --quiet HEAD -- || echo -dirty)
 
-.PHONY: build image push clippy fmt test test-unit test-integration deploy undeploy clean
+.PHONY: build image push clippy fmt test test-unit test-integration test-chart deploy undeploy clean
 
 build:
 	cargo build --release
@@ -23,8 +23,12 @@ test-unit:
 test-integration:
 	cargo test --test server
 
-# All tests.
-test: test-unit test-integration
+# Render the chart with Helm and verify distribution mounts and isolation.
+test-chart:
+	cargo test --test helm
+
+# All tests (requires Helm on PATH).
+test: test-unit test-integration test-chart
 
 # .git is not in the docker build context — hand the commit in explicitly.
 image:
