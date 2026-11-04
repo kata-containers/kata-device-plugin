@@ -80,7 +80,7 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned()],
+                devices_i_ds: vec!["0000:05:00".to_owned()],
             }],
         }))
         .await
@@ -88,7 +88,7 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
         .into_inner();
     assert_eq!(
         resp.container_responses[0].cdi_devices[0].name,
-        "nvidia.com/nvswitch-fabric=0"
+        "nvidia.com/nvswitch-fabric=0000:05:00"
     );
 
     node.shutdown().await;
@@ -135,8 +135,9 @@ async fn allocate(sock: PathBuf, ids: &[&str]) -> Result<Vec<ContainerAllocateRe
         .map(|response| response.into_inner().container_responses)
 }
 
-async fn allocate_first(sock: PathBuf) -> ContainerAllocateResponse {
-    allocate(sock, &["0"]).await.unwrap().remove(0)
+/// The fabric at slot 0000:05:00, as every test here lays it out.
+async fn allocate_fabric(sock: PathBuf) -> ContainerAllocateResponse {
+    allocate(sock, &["0000:05:00"]).await.unwrap().remove(0)
 }
 
 #[tokio::test]
@@ -162,8 +163,11 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
         Some("http://10.0.0.7:9877"),
     )
     .await;
-    let resp = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
-    assert_eq!(resp.cdi_devices[0].name, "nvidia.com/nvswitch-fabric=0");
+    let resp = allocate_fabric(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    assert_eq!(
+        resp.cdi_devices[0].name,
+        "nvidia.com/nvswitch-fabric=0000:05:00"
+    );
     let token = view.token();
     assert_ne!(
         token, before,
@@ -173,7 +177,7 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     assert_eq!(resp.envs[ENDPOINT_ENV], "http://10.0.0.7:9877");
     assert_eq!(resp.envs.len(), 2);
 
-    let again = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    let again = allocate_fabric(sockets.path().join("kata-nvswitch-fabric.sock")).await;
     assert_ne!(again.envs[TOKEN_ENV], token);
     assert_eq!(again.envs[TOKEN_ENV], view.token());
 
@@ -183,8 +187,11 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     let owner = published(fabric_view("gpu", &[])).await;
     let (gpu_stop, gpu) =
         server_with_view("nvidia.com/gpu", &vfio, &sockets, &owner.view, None).await;
-    let resp = allocate_first(sockets.path().join("kata-gpu.sock")).await;
-    assert_eq!(resp.cdi_devices[0].name, "nvidia.com/gpu=0");
+    let resp = allocate(sockets.path().join("kata-gpu.sock"), &["0000:02:00"])
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(resp.cdi_devices[0].name, "nvidia.com/gpu=0000:02:00");
     assert!(resp.envs.is_empty());
     assert_eq!(view.token(), again.envs[TOKEN_ENV]);
     owner.stop.cancel();
@@ -194,7 +201,7 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     fabric.await.unwrap().unwrap();
     let (fabric_stop, fabric) =
         server_with_view("nvidia.com/nvswitch-fabric", &vfio, &sockets, &view, None).await;
-    let resp = allocate_first(sockets.path().join("kata-nvswitch-fabric.sock")).await;
+    let resp = allocate_fabric(sockets.path().join("kata-nvswitch-fabric.sock")).await;
     assert_eq!(resp.envs.len(), 1);
     assert_eq!(resp.envs[TOKEN_ENV], view.token());
 
@@ -220,10 +227,10 @@ async fn a_failed_or_empty_allocate_keeps_the_holders_token() {
         server_with_view("nvidia.com/nvswitch-fabric", &vfio, &sockets, &view, None).await;
     let sock = sockets.path().join("kata-nvswitch-fabric.sock");
 
-    let holder = allocate_first(sock.clone()).await.envs[TOKEN_ENV].clone();
+    let holder = allocate_fabric(sock.clone()).await.envs[TOKEN_ENV].clone();
     assert_eq!(holder, view.token());
 
-    let status = allocate(sock.clone(), &["1"]).await.unwrap_err();
+    let status = allocate(sock.clone(), &["0000:06:00"]).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::NotFound);
     assert_eq!(view.token(), holder);
 
@@ -296,7 +303,7 @@ async fn active_partitions_are_served_as_nvlink_units() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["1".to_owned()],
+                devices_i_ds: vec!["p7".to_owned()],
             }],
         }))
         .await
@@ -304,7 +311,7 @@ async fn active_partitions_are_served_as_nvlink_units() {
         .into_inner();
     assert_eq!(
         resp.container_responses[0].cdi_devices[0].name,
-        "nvidia.com/nvlink-2gpu=1"
+        "nvidia.com/nvlink-2gpu=p7"
     );
     assert!(resp.container_responses[0].envs.is_empty());
 
@@ -344,7 +351,7 @@ async fn an_incomplete_partition_is_served_unhealthy() {
         .iter()
         .map(|d| (d.id.as_str(), d.health.as_str()))
         .collect();
-    assert_eq!(health, [("0", "Healthy"), ("1", "Unhealthy")]);
+    assert_eq!(health, [("p7", "Healthy"), ("p6", "Unhealthy")]);
 
     let spec: Spec =
         serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvlink-2gpu.yaml").unwrap()).unwrap();
@@ -355,7 +362,7 @@ async fn an_incomplete_partition_is_served_unhealthy() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["1".to_owned()],
+                devices_i_ds: vec!["p6".to_owned()],
             }],
         }))
         .await

@@ -127,11 +127,14 @@ async fn registers_with_kubelet_and_lists_devices() {
     let second = tokio::time::timeout(Duration::from_millis(300), stream.message()).await;
     assert!(second.is_err(), "ListAndWatch stream ended after snapshot");
 
-    // IDs are positions in the sorted enumeration — the same indices the CDI
-    // spec maps to cdev paths.
-    let mut ids: Vec<u32> = resp.devices.iter().map(|d| d.id.parse().unwrap()).collect();
+    // IDs are the devices' PCI slots, the names the CDI spec maps to cdev
+    // paths.
+    let mut ids: Vec<&str> = resp.devices.iter().map(|d| d.id.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        ids,
+        ["0000:00:00", "0000:01:00", "0000:02:00", "0000:03:00"]
+    );
     for d in &resp.devices {
         assert_eq!(d.health, "Healthy");
     }
@@ -157,7 +160,7 @@ async fn allocate_returns_cdi_device_names() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned(), "1".to_owned()],
+                devices_i_ds: vec!["0000:00:00".to_owned(), "0000:01:00".to_owned()],
             }],
         }))
         .await
@@ -170,7 +173,10 @@ async fn allocate_returns_cdi_device_names() {
         .iter()
         .map(|d| d.name.as_str())
         .collect();
-    assert_eq!(cdi_names, vec!["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
+    assert_eq!(
+        cdi_names,
+        vec!["nvidia.com/gpu=0000:00:00", "nvidia.com/gpu=0000:01:00"]
+    );
     // No DeviceSpec — device injection is the Kata shim's job, resolving CDI
     // names against the host spec, not the kubelet's via device paths.
     assert!(resp.container_responses[0].devices.is_empty());
@@ -196,7 +202,7 @@ async fn allocate_rejects_ids_beyond_present_devices() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned(), "1".to_owned()],
+                devices_i_ds: vec!["0000:00:00".to_owned(), "0000:01:00".to_owned()],
             }],
         }))
         .await

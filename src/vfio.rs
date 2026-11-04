@@ -14,6 +14,31 @@ pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as S
 /// siblings.
 pub type Device = Vec<IommufdDev>;
 
+/// One advertised device: the ID the kubelet, the CDI spec and Allocate
+/// share, and the cdevs behind it.  The ID is a fact about the device, so a
+/// change elsewhere in the list never renames a device a pod already holds,
+/// the way an index would: the PCI slot of the first function for a GPU or
+/// the fabric, `p<id>` for a Fabric Manager partition.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    pub device: Device,
+}
+
+impl Entry {
+    /// Named by the lowest slot among its functions, so a fabric spanning
+    /// several slots keeps its ID whatever order its cdevs were bound in.
+    fn by_slot(device: Device) -> Self {
+        let id = device
+            .iter()
+            .map(|cdev| pcilibs_rs::slot(&cdev.bdf))
+            .min()
+            .unwrap_or_default()
+            .to_owned();
+        Self { id, device }
+    }
+}
+
 /// How a row's bound functions become advertised devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
@@ -251,30 +276,31 @@ pub fn discover(
         .collect()
 }
 
-/// The devices advertised under one resource name, in the kubelet's ID
-/// order.  `devices[..healthy]` are the units, allocatable and named in the
-/// CDI spec; the rest are active partitions that are not units, advertised
-/// Unhealthy so the kubelet counts them in capacity and leaves them out of
-/// allocatable: the partition the Service VM activated stays visible on the
-/// node while nothing can be scheduled on it.
+/// The devices advertised under one resource name.  `entries[..healthy]` are
+/// allocatable and named in the CDI spec; the rest are active partitions
+/// that are not units, advertised Unhealthy so the kubelet counts them in
+/// capacity and leaves them out of allocatable: the partition the Service
+/// VM activated stays visible on the node while nothing can be scheduled on
+/// it.
 #[derive(Debug, Default)]
 pub struct Units {
-    pub devices: Vec<Device>,
+    pub entries: Vec<Entry>,
     pub healthy: usize,
 }
 
 impl Units {
-    pub fn allocatable(&self) -> &[Device] {
-        &self.devices[..self.healthy]
+    pub fn allocatable(&self) -> &[Entry] {
+        &self.entries[..self.healthy]
     }
 }
 
-/// Every device a unit.
+/// Every device a unit, named by its slot.
 impl From<Vec<Device>> for Units {
     fn from(devices: Vec<Device>) -> Self {
+        let entries: Vec<Entry> = devices.into_iter().map(Entry::by_slot).collect();
         Self {
-            healthy: devices.len(),
-            devices,
+            healthy: entries.len(),
+            entries,
         }
     }
 }
@@ -375,9 +401,13 @@ fn partition_units(
             .iter()
             .flat_map(|(_, device)| device.iter().cloned())
             .collect();
+        let advertised = Entry {
+            id: format!("p{}", partition.id),
+            device,
+        };
         let entry = units.entry(name).or_default();
         if partition.advertisable() {
-            entry.devices.insert(entry.healthy, device);
+            entry.entries.insert(entry.healthy, advertised);
             entry.healthy += 1;
         } else {
             let why = if !partition.supported {
@@ -388,7 +418,7 @@ fn partition_units(
                 "not every GPU is bound and labeled here"
             };
             reasons.push(format!("{}: Unhealthy, {why}", partition.id));
-            entry.devices.push(device);
+            entry.entries.push(advertised);
         }
     }
     if !reasons.is_empty() {
@@ -501,12 +531,24 @@ mod tests {
         super::discover(vfio_dir, sysfs, naming, view)
             .into_iter()
             .filter(|(_, units)| units.healthy > 0)
-            .map(|(name, units)| (name, units.allocatable().to_vec()))
+            .map(|(name, units)| (name, devices(units.allocatable())))
             .collect()
     }
 
-    fn unhealthy(units: &Units) -> &[Device] {
-        &units.devices[units.healthy..]
+    fn devices(units: &[Entry]) -> Vec<Device> {
+        units.iter().map(|unit| unit.device.clone()).collect()
+    }
+
+    fn unhealthy(units: &Units) -> Vec<Device> {
+        devices(&units.entries[units.healthy..])
+    }
+
+    fn ids(units: &Units) -> Vec<&str> {
+        units
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect()
     }
 
     /// Cdev numbers per advertised device.
@@ -905,8 +947,9 @@ mod tests {
             Some(&view("partition", PAIRS)),
         );
         let pairs = &units["nvidia.com/nvlink-2gpu"];
-        assert_eq!(nums(pairs.allocatable()), vec![vec![0, 2]]);
-        assert_eq!(nums(unhealthy(pairs)), vec![vec![3]]);
+        assert_eq!(nums(&devices(pairs.allocatable())), vec![vec![0, 2]]);
+        assert_eq!(nums(&unhealthy(pairs)), vec![vec![3]]);
+        assert_eq!(ids(pairs), ["p7", "p6"]);
 
         // Fabric Manager lists pair 7 as unsupported: unhealthy as well, with
         // both members, so nothing is allocatable.
@@ -921,7 +964,7 @@ mod tests {
         let units = super::discover(r, &Sysfs::new(r), Naming::Alias, Some(&unsupported));
         let pairs = &units["nvidia.com/nvlink-2gpu"];
         assert_eq!(pairs.healthy, 0);
-        assert_eq!(nums(unhealthy(pairs)), vec![vec![3], vec![0, 2]]);
+        assert_eq!(nums(&unhealthy(pairs)), vec![vec![3], vec![0, 2]]);
 
         // Two active partitions naming GPU 7: neither is a unit, both are
         // unhealthy, the single under the plain GPU name.
@@ -939,11 +982,57 @@ mod tests {
             ["nvidia.com/gpu", "nvidia.com/nvlink-2gpu"]
         );
         let pairs = &units["nvidia.com/nvlink-2gpu"];
-        assert_eq!(nums(pairs.allocatable()), vec![vec![3, 1]]);
-        assert_eq!(nums(unhealthy(pairs)), vec![vec![0, 2]]);
+        assert_eq!(nums(&devices(pairs.allocatable())), vec![vec![3, 1]]);
+        assert_eq!(nums(&unhealthy(pairs)), vec![vec![0, 2]]);
         let single = &units["nvidia.com/gpu"];
         assert_eq!(single.healthy, 0);
-        assert_eq!(nums(unhealthy(single)), vec![vec![0]]);
+        assert_eq!(nums(&unhealthy(single)), vec![vec![0]]);
+        assert_eq!(ids(single), ["p14"]);
+    }
+
+    #[test]
+    fn a_fabrics_id_is_its_lowest_slot_whatever_the_cdev_order() {
+        // H100: switch chips in several slots.  The cdev numbers follow the
+        // bind order, the lowest slot does not.
+        for (low, high) in [(5u32, 9u32), (9, 5)] {
+            let root = TempDir::new().unwrap();
+            let r = root.path();
+            pcilibs_rs::testfs::add_at(r, low, "0000:0c:00.0", 0x10de, 0x22a3, 0x068000);
+            pcilibs_rs::testfs::add_at(r, high, "0000:03:00.0", 0x10de, 0x22a3, 0x068000);
+            let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+            assert_eq!(ids(&units["nvidia.com/nvswitch-fabric"]), ["0000:03:00"]);
+        }
+    }
+
+    #[test]
+    fn ids_are_the_slot_of_a_device_and_the_id_of_a_partition() {
+        // A GPU's or the fabric's ID is its PCI slot, a partition's is
+        // Fabric Manager's id: neither moves when another device comes or
+        // goes, so a pod's allocation keeps naming what it holds.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        testfs::add_gpu(r, 42);
+        testfs::add_gpu(r, 7);
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:07:00", "0000:2a:00"]);
+        std::fs::remove_file(r.join("devices/vfio7")).unwrap();
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(ids(&units["nvidia.com/gpu"]), ["0000:2a:00"]);
+
+        // A bound fabric without a view advertises no GPU, so the fabric is
+        // checked on its own.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        for function in 0..4u32 {
+            testfs::add_connectx(
+                r,
+                10 + function,
+                &format!("0000:05:00.{function}"),
+                function < 2,
+            );
+        }
+        let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(ids(&units["nvidia.com/nvswitch-fabric"]), ["0000:05:00"]);
     }
 
     #[test]

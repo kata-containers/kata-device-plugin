@@ -62,9 +62,14 @@ For each present resource the plugin:
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,
-3. answers `Allocate` with CDI device names (`nvidia.com/gpu=0`) — the
+3. answers `Allocate` with CDI device names (`nvidia.com/gpu=0000:1a:00`, the slot; `p2` for a partition) — the
    container runtime resolves them against the host CDI registry, and the
    Kata shim wires the cold-plugged VM devices to the right container.
+
+Device IDs were indices before 0.2.0. The kubelet keeps a running pod's
+allocation under the IDs it was given, which then name no device, so drain the
+pods holding GPUs or the fabric before rolling this plugin onto a node that ran
+an older one.
 
 The kubelet forwards those CDI names to the container runtime only with
 `DevicePluginCDIDevices`, which is on in every supported Kubernetes release.
