@@ -26,11 +26,16 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Named by the lowest slot among its functions, so a fabric spanning
+    /// several slots keeps its ID whatever order its cdevs were bound in.
     fn by_slot(device: Device) -> Self {
-        Self {
-            id: pcilibs_rs::slot(&device[0].bdf).to_owned(),
-            device,
-        }
+        let id = device
+            .iter()
+            .map(|cdev| pcilibs_rs::slot(&cdev.bdf))
+            .min()
+            .unwrap_or_default()
+            .to_owned();
+        Self { id, device }
     }
 }
 
@@ -983,6 +988,20 @@ mod tests {
         assert_eq!(single.healthy, 0);
         assert_eq!(nums(&unhealthy(single)), vec![vec![0]]);
         assert_eq!(ids(single), ["p14"]);
+    }
+
+    #[test]
+    fn a_fabrics_id_is_its_lowest_slot_whatever_the_cdev_order() {
+        // H100: switch chips in several slots.  The cdev numbers follow the
+        // bind order, the lowest slot does not.
+        for (low, high) in [(5u32, 9u32), (9, 5)] {
+            let root = TempDir::new().unwrap();
+            let r = root.path();
+            pcilibs_rs::testfs::add_at(r, low, "0000:0c:00.0", 0x10de, 0x22a3, 0x068000);
+            pcilibs_rs::testfs::add_at(r, high, "0000:03:00.0", 0x10de, 0x22a3, 0x068000);
+            let units = super::discover(r, &Sysfs::new(r), Naming::Alias, None);
+            assert_eq!(ids(&units["nvidia.com/nvswitch-fabric"]), ["0000:03:00"]);
+        }
     }
 
     #[test]

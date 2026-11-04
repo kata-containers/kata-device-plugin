@@ -66,6 +66,11 @@ For each present resource the plugin:
    container runtime resolves them against the host CDI registry, and the
    Kata shim wires the cold-plugged VM devices to the right container.
 
+Device IDs were indices before 0.2.0. The kubelet keeps a running pod's
+allocation under the IDs it was given, which then name no device, so drain the
+pods holding GPUs or the fabric before rolling this plugin onto a node that ran
+an older one.
+
 The kubelet forwards those CDI names to the container runtime only with
 `DevicePluginCDIDevices`, which is on in every supported Kubernetes release.
 On a kubelet without it the Kata VM still boots with the GPU, since the shim
