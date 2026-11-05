@@ -14,7 +14,7 @@ use tracing::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
+use kata_fabric_api::{ENDPOINT_ENV, TOKEN_ENV};
 
 use crate::cdi;
 use crate::vfio::{self, Naming, Sysfs};

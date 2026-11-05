@@ -15,8 +15,8 @@ use kata_device_plugin::dp::v1beta1::{
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
 use kata_device_plugin::view::View;
-use pcilibs_rs::fabric::{ENDPOINT_ENV, TOKEN_ENV};
-use pcilibs_rs::testfs::{add as add_dev, add_connectx};
+use kata_fabric_api::{ENDPOINT_ENV, TOKEN_ENV};
+use pcilibs_rs::testfs::{add as add_dev, add_connectx_cdev};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Status};
@@ -33,14 +33,14 @@ async fn management_pfs_are_served_as_one_nvswitch_fabric() {
     // VFIO-bound for some other purpose, must not be advertised.
     let vfio = fake_vfio(2);
     for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
-        add_connectx(
+        add_connectx_cdev(
             vfio.path(),
             n,
             &format!("0000:05:00.{function}"),
             function < 2,
         );
     }
-    add_connectx(vfio.path(), 6, "0000:18:00.0", false);
+    add_connectx_cdev(vfio.path(), 6, "0000:18:00.0", false);
 
     let owner = published(fabric_view("gpu", &[])).await;
     let node = Node::start_with_view(
@@ -147,7 +147,7 @@ async fn fabric_allocate_hands_its_holder_endpoint_and_a_fresh_token() {
     // the token so the previous holder's copy stops working.
     let vfio = TempDir::new().unwrap();
     for (n, function, marker) in [(1, 0, true), (3, 1, true), (4, 2, false), (5, 3, false)] {
-        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
+        add_connectx_cdev(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
     }
     add_dev(vfio.path(), 2, 0x10de, 0x2330, 0x030200);
     let state = TempDir::new().unwrap();
@@ -218,7 +218,7 @@ async fn a_failed_or_empty_allocate_keeps_the_holders_token() {
     // fabric to nobody; neither revokes the current holder's token.
     let vfio = TempDir::new().unwrap();
     for (n, function, marker) in [(0, 0, true), (1, 1, true), (2, 2, false), (3, 3, false)] {
-        add_connectx(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
+        add_connectx_cdev(vfio.path(), n, &format!("0000:05:00.{function}"), marker);
     }
     let state = TempDir::new().unwrap();
     let view = View::load(state.path()).unwrap();

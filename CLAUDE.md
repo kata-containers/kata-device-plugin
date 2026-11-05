@@ -17,6 +17,9 @@ src/
   cdi.rs       host-side CDI spec writer (read by the Kata shim)
 proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
+crates/
+  fabric-api/  the fabric view's schema: proto, generated types with serde, the Publish call's two ends, the token
+  fmclient/    the Fabric Manager SDK client: lists and activates partitions, publishes the view from the Service VM
 build.rs       prost/tonic codegen from proto
 deploy/
   helm/kata-device-plugin/   the only deployment model

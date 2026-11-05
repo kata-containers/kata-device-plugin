@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use pcilibs_rs::fabric::grpc::{require_token, FabricViewService, FabricViewServiceServer};
-use pcilibs_rs::fabric::v1::{FabricView, PublishResponse};
-use pcilibs_rs::fabric::HOST_SOCKET;
+use kata_fabric_api::grpc::{require_token, FabricViewService, FabricViewServiceServer};
+use kata_fabric_api::v1::{FabricView, PublishResponse};
+use kata_fabric_api::HOST_SOCKET;
 use tokio::net::{TcpListener, UnixListener};
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ use tracing::{info, warn};
 /// socket.  A pod restart keeps it; a node reboot clears it along with every
 /// Service VM that held a token.
 pub const STATE_DIR: &str = "/var/run/kata-device-plugin";
-/// The host socket, a pcilibs-rs contract shared with the publisher.
+/// The host socket, a kata-fabric-api contract shared with the publisher.
 pub const SOCKET: &str = HOST_SOCKET;
 const TOKEN_FILE: &str = "fabric-view.token";
 /// The last view published, as JSON with fmpm's field names, so an operator
@@ -265,8 +265,8 @@ mod tests {
     use std::time::Duration;
 
     use hyper_util::rt::TokioIo;
-    use pcilibs_rs::fabric::grpc::{with_token, FabricViewServiceClient};
-    use pcilibs_rs::fabric::v1;
+    use kata_fabric_api::grpc::{with_token, FabricViewServiceClient};
+    use kata_fabric_api::v1;
     use tempfile::TempDir;
     use tonic::transport::{Channel, Endpoint, Uri};
     use tonic::Code;

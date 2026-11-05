@@ -15,8 +15,8 @@ use kata_device_plugin::dp::v1beta1::{
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
 use kata_device_plugin::view::{self, View};
-use pcilibs_rs::fabric::grpc::FabricViewServiceClient;
-use pcilibs_rs::fabric::v1::{self, FabricView};
+use kata_fabric_api::grpc::FabricViewServiceClient;
+use kata_fabric_api::v1::{self, FabricView};
 use pcilibs_rs::testfs::{add as add_dev, add_at};
 use tempfile::TempDir;
 use tokio::net::UnixListener;

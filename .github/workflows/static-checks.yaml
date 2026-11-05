@@ -82,6 +82,7 @@ jobs:
               - '**/*.lock'
               - 'Cargo.lock'
               - 'proto/**'
+              - 'crates/**'
               - '.github/workflows/static-checks.yaml'
               - '.github/actions/**'
 
@@ -102,7 +103,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: $/.github/actions/rust-toolchain
 
-      - run: cargo test --locked --all-features -- --include-ignored
+      - run: cargo test --locked --workspace --all-features -- --include-ignored
 
   # Check code formatting against Rust style guidelines
   formatting:
@@ -141,7 +142,7 @@ jobs:
         with:
           components: clippy
 
-      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
   # Check dependencies for known security vulnerabilities
   security:
@@ -175,7 +176,9 @@ jobs:
         uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-deny --locked
-      - run: cargo deny check
+      # Every workspace member is a root: the plugin alone would leave
+      # fmclient's dependencies unaudited.
+      - run: cargo deny --workspace check
 
   # Detect unused dependencies in Cargo.toml
   unused-deps:
@@ -199,7 +202,7 @@ jobs:
       # +nightly: a bare cargo install would pull the pinned toolchain
       - run: cargo +nightly install cargo-udeps --locked
       # +nightly outranks rust-toolchain.toml; udeps needs nightly-only -Z flags
-      - run: cargo +nightly udeps --locked --all-features --all-targets
+      - run: cargo +nightly udeps --locked --workspace --all-features --all-targets
 
   # Analyze binary size and identify largest functions
   bloat:

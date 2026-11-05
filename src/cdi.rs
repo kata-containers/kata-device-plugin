@@ -206,7 +206,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let cdi_dir = TempDir::new().unwrap();
         for function in 0..4u32 {
-            testfs::add_connectx(
+            testfs::add_connectx_cdev(
                 root.path(),
                 function,
                 &format!("0000:05:00.{function}"),
