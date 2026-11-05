@@ -39,11 +39,15 @@ jobs:
               - '**/*.toml'
               - '**/*.lock'
               - 'proto/**'
+              - 'crates/**'
               - 'build.rs'
               - '.github/workflows/coverage.yaml'
 
   coverage:
     name: Code coverage
+    env:
+      # Files the gate skips: the plugin's process wiring in main.rs.
+      IGNORE: 'src/main\.rs$'
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
@@ -68,7 +72,7 @@ jobs:
       # src/main.rs is exempt: start-servers-and-wait wiring that only runs
       # end-to-end against a real kubelet.
       - name: Generate coverage
-        run: cargo llvm-cov --locked --all-targets --ignore-filename-regex 'src/main\.rs$' --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --workspace --all-targets --ignore-filename-regex "${IGNORE}" --lcov --output-path lcov.info
 
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
@@ -82,4 +86,4 @@ jobs:
       # (plugin.rs) — the per-file bound stops an aggregate score from
       # masking an under-tested module.
       - name: Enforce minimum line coverage (90% total, 85% per file)
-        run: cargo llvm-cov report --fail-under-lines 90 --fail-under-file-lines 85 --ignore-filename-regex 'src/main\.rs$'
+        run: cargo llvm-cov report --fail-under-lines 90 --fail-under-file-lines 85 --ignore-filename-regex "${IGNORE}"

@@ -2,7 +2,9 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use pcilibs_rs::fabric::{self, v1::FabricView};
+use kata_fabric_api::v1::FabricView;
+use kata_fabric_api::Unit as ViewUnit;
+use pcilibs_rs::fabric;
 use pcilibs_rs::platform::{GpuFunction, Topology};
 pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
@@ -360,19 +362,20 @@ fn partition_units(
             return BTreeMap::new();
         }
     };
-    let Some(resolved) = fabric::resolve(view, &modules) else {
+    let Some(unit) = ViewUnit::from_view(&view.unit) else {
         tracing::warn!(
             unit = %view.unit,
             "partition view carries an unknown unit, advertising no GPU"
         );
         return BTreeMap::new();
     };
-    if resolved.unit == fabric::Unit::Gpu {
+    if unit == ViewUnit::Gpu {
         return by_slot(gpus);
     }
+    let resolved = fabric::resolve(&partitions(view), &unsupported(view), &modules);
     let mut units: BTreeMap<String, Units> = BTreeMap::new();
     let mut reasons: Vec<String> = Vec::new();
-    for partition in resolved.partitions.iter().filter(|p| p.active) {
+    for partition in resolved.iter().filter(|p| p.active) {
         // The members this host has; `bdfs()` are functions passed in above,
         // so every one of them is bound.  A unit has all of them.
         let members: Vec<&(String, Device)> = partition
@@ -425,6 +428,31 @@ fn partition_units(
         tracing::warn!(partitions = ?reasons, "active partitions that are not units");
     }
     units
+}
+
+/// Fabric Manager's lists as the resolver takes them: ids and physical IDs.
+fn partitions(view: &FabricView) -> Vec<fabric::Partition> {
+    view.partitions
+        .iter()
+        .flat_map(|list| list.partition_info.iter())
+        .map(|partition| fabric::Partition {
+            id: partition.partition_id,
+            active: partition.is_active,
+            physical_ids: partition
+                .gpu_info
+                .iter()
+                .map(|gpu| gpu.physical_id)
+                .collect(),
+        })
+        .collect()
+}
+
+fn unsupported(view: &FabricView) -> Vec<u32> {
+    view.unsupported
+        .iter()
+        .flat_map(|list| list.partition_info.iter())
+        .map(|partition| partition.partition_id)
+        .collect()
 }
 
 /// The node's switch chips and NVSwitch management PFs, bound or not.  The
@@ -495,7 +523,7 @@ fn sanitize(raw: &str) -> String {
 pub(crate) mod testfs {
     use std::path::Path;
 
-    pub use pcilibs_rs::testfs::{add, add_connectx};
+    pub use pcilibs_rs::testfs::{add, add_connectx_cdev};
 
     /// An H100 SXM5 80GB: pci-ids 10de:2330, so SKU naming is exercised
     /// against the real database.
@@ -664,10 +692,10 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         for (n, function, marker) in [(1, 0, true), (3, 1, true), (4, 2, false), (5, 3, false)] {
-            testfs::add_connectx(r, n, &format!("0000:05:00.{function}"), marker);
+            testfs::add_connectx_cdev(r, n, &format!("0000:05:00.{function}"), marker);
         }
         testfs::add_gpu(r, 2);
-        testfs::add_connectx(r, 6, "0000:18:00.0", false);
+        testfs::add_connectx_cdev(r, 6, "0000:18:00.0", false);
 
         let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(
@@ -730,7 +758,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         for function in 0..4u32 {
-            testfs::add_connectx(r, function, &format!("0000:05:00.{function}"), function < 2);
+            testfs::add_connectx_cdev(r, function, &format!("0000:05:00.{function}"), function < 2);
         }
         for function in 2..4u32 {
             std::fs::remove_file(r.join(format!("devices/vfio{function}"))).unwrap();
@@ -747,8 +775,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         testfs::add_gpu(r, 0);
-        testfs::add_connectx(r, 1, "0000:05:00.0", true);
-        testfs::add_connectx(r, 2, "0000:05:00.1", false);
+        testfs::add_connectx_cdev(r, 1, "0000:05:00.0", true);
+        testfs::add_connectx_cdev(r, 2, "0000:05:00.1", false);
         testfs::add_nvswitch(r, 3);
         // Every ConnectX fixture has a VPD; swap the file for a directory.
         let vpd = Sysfs::new(r).device("0000:05:00.1").unwrap().join("vpd");
@@ -765,7 +793,7 @@ mod tests {
         // A fabric spans PCI devices; a ConnectX SKU would misname it.
         let root = TempDir::new().unwrap();
         let r = root.path();
-        testfs::add_connectx(r, 0, "0000:05:00.0", true);
+        testfs::add_connectx_cdev(r, 0, "0000:05:00.0", true);
 
         let map = discover(r, &Sysfs::new(r), Naming::Sku, None);
         assert_eq!(
@@ -824,7 +852,7 @@ mod tests {
         assert!(Naming::parse("").is_err());
     }
 
-    use pcilibs_rs::fabric::v1;
+    use kata_fabric_api::v1;
 
     /// The first four GPUs of a DGX NVL8, labeled as its firmware does:
     /// cdev n at a slot whose module is Fabric Manager's physical id.
@@ -1024,7 +1052,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let r = root.path();
         for function in 0..4u32 {
-            testfs::add_connectx(
+            testfs::add_connectx_cdev(
                 r,
                 10 + function,
                 &format!("0000:05:00.{function}"),
