@@ -2,6 +2,8 @@
 name = "fmclient"
 version = "2.0.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "NVIDIA Fabric Manager client: partitions, NVLink status, and the fabric view it publishes to kata-device-plugin"
 
 [[bin]]
 name = "fmclient"
@@ -9,15 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-# The fabric view's schema lives with its consumer, kata-device-plugin, in
-# pcilibs-rs; this client only fills it from the FM SDK and publishes it with
-# the generated stubs.  No crates.io release yet; pinned to the fabric-vsock
-# head.
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "174983c", default-features = false, features = ["fabric-grpc"] }
+# The view's schema and the Publish call's client end, beside the plugin
+# that serves it.
+kata-fabric-api = { path = "../fabric-api" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # dup/dup2 on the standard descriptors, see claim_stdout.
 libc = "0.2"
+# libnvfm is loaded when the program starts, so the build needs no Fabric
+# Manager SDK and a host without one runs every test that does not call it.
+libloading = "0.8"
 # The Publish call to kata-device-plugin; tonic's own transport dials TCP,
 # the unix socket goes through a connector.
 hyper-util = { version = "0.1", features = ["tokio"] }

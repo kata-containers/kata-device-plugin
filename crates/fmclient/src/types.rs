@@ -2,14 +2,15 @@
 // Copyright (c) NVIDIA CORPORATION
 
 //! The FM SDK structs filled into the fabric view's wire types, which live
-//! with their consumer in pcilibs-rs, and rendered as tables for a terminal.
+//! beside their consumer in kata-fabric-api, and rendered as tables for a
+//! terminal.
 //! The JSON rendering is serde's, so what this client prints is what it
 //! will stream.
 
 use std::fmt::{self, Write as _};
 use std::os::raw::c_char;
 
-use pcilibs_rs::fabric::v1;
+use kata_fabric_api::v1;
 use serde::Serialize;
 
 use crate::ffi;
@@ -74,7 +75,7 @@ pub fn unsupported_partition_list(
 }
 
 /// What `-o json` and `-o table` print.  The wire types are generated in
-/// pcilibs-rs and cannot carry a `Display` of their own, so the table
+/// kata-fabric-api and cannot carry a `Display` of their own, so the table
 /// rendering is a trait implemented here, beside the conversions.
 pub trait Render: Serialize {
     fn table(&self) -> String;

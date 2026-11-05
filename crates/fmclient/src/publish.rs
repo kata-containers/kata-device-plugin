@@ -7,8 +7,8 @@
 //! it hands the fabric to a new holder, so the command that changes
 //! partitions publishes the result and exits; nothing stays connected.  The
 //! plugin hands the one container it gives the fabric to an endpoint and a
-//! token through its environment ([`pcilibs_rs::fabric::ENDPOINT_ENV`],
-//! [`pcilibs_rs::fabric::TOKEN_ENV`]).  On the host the plugin also listens
+//! token through its environment ([`kata_fabric_api::ENDPOINT_ENV`],
+//! [`kata_fabric_api::TOKEN_ENV`]).  On the host the plugin also listens
 //! on a unix socket; `unix://<path>` selects it, and no token is needed there
 //! because the socket's permissions are the credential.
 
@@ -16,8 +16,8 @@ use std::error::Error;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-use pcilibs_rs::fabric::grpc::{with_token, FabricViewServiceClient};
-use pcilibs_rs::fabric::v1::FabricView;
+use kata_fabric_api::grpc::{with_token, FabricViewServiceClient};
+use kata_fabric_api::v1::FabricView;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::Request;
 use tower::service_fn;
@@ -32,8 +32,8 @@ pub struct Target {
 }
 
 impl Target {
-    /// From the values the plugin injects ([`pcilibs_rs::fabric::ENDPOINT_ENV`],
-    /// [`pcilibs_rs::fabric::TOKEN_ENV`])
+    /// From the values the plugin injects ([`kata_fabric_api::ENDPOINT_ENV`],
+    /// [`kata_fabric_api::TOKEN_ENV`])
     /// or a flag; `None` without an endpoint, and an empty token is no token.
     pub fn from_vars(endpoint: Option<String>, token: Option<String>) -> Option<Self> {
         let endpoint = endpoint.filter(|endpoint| !endpoint.is_empty())?;
@@ -97,8 +97,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use pcilibs_rs::fabric::grpc::{require_token, FabricViewService, FabricViewServiceServer};
-    use pcilibs_rs::fabric::v1::{self, PublishResponse};
+    use kata_fabric_api::grpc::{require_token, FabricViewService, FabricViewServiceServer};
+    use kata_fabric_api::v1::{self, PublishResponse};
     use tokio_stream::wrappers::UnixListenerStream;
     use tokio_util::sync::CancellationToken;
     use tonic::{Code, Response, Status};

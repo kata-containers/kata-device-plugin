@@ -6,25 +6,28 @@ vsock connections to Fabric Manager.
 
 ## Building
 
-### With Cargo (requires `libnvfm` and headers)
+From the repository root:
 
 ```sh
-cargo build --release
+cargo build --release -p fmclient
 ```
 
-The binary links against `libnvfm.so` from the
-`nvidia-fabricmanager-dev-<VERSION>` package.
+The build needs no Fabric Manager SDK: `libnvfm.so.1` is loaded when the
+program starts, from the `nvidia-fabricmanager-dev-<VERSION>` package or
+wherever the loader finds it, and a missing library is one error at startup.
+The test that touches the SDK runs only where it is installed.
 
 ### With Docker
 
 ```sh
-docker build -t fmclient .
+docker build -f crates/fmclient/Dockerfile -t fmclient .
 ```
 
-The FM driver version defaults to 590. Override with:
+The FM version defaults to 590 and must match Fabric Manager in the guest
+image, or every connect fails with a version mismatch. Override with:
 
 ```sh
-docker build --build-arg FM_VERSION=570 -t fmclient .
+docker build -f crates/fmclient/Dockerfile --build-arg FM_VERSION=570 -t fmclient .
 ```
 
 ## Usage
@@ -64,7 +67,7 @@ fmclient -l
 #    8      no     1    0/0          26562  2
 #  ...
 
-# List partitions as JSON.  The schema is kata.fabric.v1 from pcilibs-rs,
+# List partitions as JSON.  The schema is kata.fabric.v1 from kata-fabric-api,
 # the same types this client publishes to kata-device-plugin, with fmpm's
 # field names: partitionInfo[].partitionId, isActive, gpuInfo[].physicalId.
 # Only JSON reaches stdout; libnvfm's own log lines go to stderr.
@@ -203,9 +206,9 @@ fmclient --vsock -l
 fmclient --vsock -a 2
 ```
 
-`--vsock` without a value is the contract address: pcilibs-rs
-`fabric::SERVICE_VM_CID` (3, the first CID kata reserves for configured VMs)
-and FM's default port. Give `CID:PORT` for anything else.
+`--vsock` without a value is the contract address: CID 3, the first CID kata
+reserves for configured VMs, and FM's default port. Give `CID:PORT` for
+anything else.
 
 A vsock connect needs no privilege on the host, so with the listener on every
 host process can reach the FM API. That is the provider-owned model; where the

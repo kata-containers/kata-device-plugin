@@ -5,26 +5,35 @@ use std::fmt;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use pcilibs_rs::fabric::v1;
+use kata_fabric_api::v1;
 
 use crate::ffi;
 use crate::types;
 
 #[derive(Debug)]
-pub struct FmError(ffi::FmReturn);
+pub enum FmError {
+    /// libnvfm could not be loaded or lacks an entry point.
+    Library(libloading::Error),
+    /// A call returned a status other than success.
+    Status(ffi::FmReturn),
+}
 
 impl FmError {
     fn from_return(ret: ffi::FmReturn) -> Result<(), Self> {
         match ret {
             ffi::FM_ST_SUCCESS => Ok(()),
-            code => Err(Self(code)),
+            code => Err(Self::Status(code)),
         }
     }
 }
 
 impl fmt::Display for FmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self.0 {
+        let code = match self {
+            Self::Library(e) => return write!(f, "Fabric Manager SDK library: {e}"),
+            Self::Status(code) => *code,
+        };
+        let msg = match code {
             ffi::FM_ST_BADPARAM => "a supplied argument is invalid",
             ffi::FM_ST_GENERIC_ERROR => "a generic, unspecified error",
             ffi::FM_ST_NOT_SUPPORTED => "the requested operation/feature not supported",
@@ -62,28 +71,33 @@ impl fmt::Display for FmError {
             ffi::FM_ST_PARTITION_ROUTE_PROGRAMMING_ERROR => "partition has route programming error",
             code => return write!(f, "unknown FM error ({})", code),
         };
-        write!(f, "{} ({})", msg, self.0)
+        write!(f, "{msg} ({code})")
     }
 }
 
 impl std::error::Error for FmError {}
 
-pub struct FmLib;
+/// The SDK, loaded and initialized; dropping it shuts the SDK down.
+pub struct FmLib {
+    api: ffi::Api,
+}
 
 impl FmLib {
     pub fn init() -> Result<Self, FmError> {
-        FmError::from_return(unsafe { ffi::fmLibInit() })?;
-        Ok(Self)
+        let api = ffi::Api::load().map_err(FmError::Library)?;
+        FmError::from_return(unsafe { (api.fm_lib_init)() })?;
+        Ok(Self { api })
     }
 }
 
 impl Drop for FmLib {
     fn drop(&mut self) {
-        unsafe { ffi::fmLibShutdown() };
+        unsafe { (self.api.fm_lib_shutdown)() };
     }
 }
 
-pub struct FmConnection {
+pub struct FmConnection<'l> {
+    api: &'l ffi::Api,
     handle: ffi::FmHandle,
 }
 
@@ -93,15 +107,16 @@ pub enum FmAddress<'a> {
     Vsock(&'a str),
 }
 
-impl FmConnection {
-    /// Requires a reference to FmLib to enforce init-before-connect ordering.
+impl<'l> FmConnection<'l> {
+    /// Borrows the SDK, so a connection never outlives its initialization.
     /// Retries on FM_ST_CONNECTION_NOT_VALID until `retry_timeout` elapses.
     pub fn connect(
-        _lib: &FmLib,
+        lib: &'l FmLib,
         address: FmAddress<'_>,
         connect_timeout_ms: u32,
         retry_timeout: Duration,
     ) -> Result<Self, FmError> {
+        let api = &lib.api;
         let mut params = unsafe { std::mem::zeroed::<ffi::FmConnectParams>() };
         params.version = ffi::FmConnectParams::version();
         params.timeout_ms = connect_timeout_ms;
@@ -125,14 +140,14 @@ impl FmConnection {
 
         loop {
             let mut handle: ffi::FmHandle = ptr::null_mut();
-            let ret = unsafe { ffi::fmConnect(&mut params, &mut handle) };
+            let ret = unsafe { (api.fm_connect)(&mut params, &mut handle) };
 
             if ret == ffi::FM_ST_SUCCESS {
-                return Ok(Self { handle });
+                return Ok(Self { api, handle });
             }
 
             if ret != ffi::FM_ST_CONNECTION_NOT_VALID || Instant::now() >= deadline {
-                return Err(FmError(ret));
+                return Err(FmError::Status(ret));
             }
 
             if !retried {
@@ -148,7 +163,7 @@ impl FmConnection {
         let mut list = unsafe { std::mem::zeroed::<ffi::FmFabricPartitionList>() };
         list.version = ffi::FmFabricPartitionList::version();
         FmError::from_return(unsafe {
-            ffi::fmGetSupportedFabricPartitions(self.handle, &mut list)
+            (self.api.fm_get_supported_fabric_partitions)(self.handle, &mut list)
         })?;
         Ok(types::partition_list(&list))
     }
@@ -157,7 +172,7 @@ impl FmConnection {
         let mut list = unsafe { std::mem::zeroed::<ffi::FmUnsupportedFabricPartitionList>() };
         list.version = ffi::FmUnsupportedFabricPartitionList::version();
         FmError::from_return(unsafe {
-            ffi::fmGetUnsupportedFabricPartitions(self.handle, &mut list)
+            (self.api.fm_get_unsupported_fabric_partitions)(self.handle, &mut list)
         })?;
         Ok(types::unsupported_partition_list(&list))
     }
@@ -172,7 +187,9 @@ impl FmConnection {
     }
 
     pub fn activate_partition(&self, partition_id: u32) -> Result<(), FmError> {
-        FmError::from_return(unsafe { ffi::fmActivateFabricPartition(self.handle, partition_id) })
+        FmError::from_return(unsafe {
+            (self.api.fm_activate_fabric_partition)(self.handle, partition_id)
+        })
     }
 
     pub fn activate_partition_with_vfs(
@@ -182,7 +199,7 @@ impl FmConnection {
     ) -> Result<(), FmError> {
         let mut vf_list: Vec<ffi::FmPciDevice> = vfs.to_vec();
         FmError::from_return(unsafe {
-            ffi::fmActivateFabricPartitionWithVFs(
+            (self.api.fm_activate_fabric_partition_with_vfs)(
                 self.handle,
                 partition_id,
                 vf_list.as_mut_ptr(),
@@ -192,7 +209,9 @@ impl FmConnection {
     }
 
     pub fn deactivate_partition(&self, partition_id: u32) -> Result<(), FmError> {
-        FmError::from_return(unsafe { ffi::fmDeactivateFabricPartition(self.handle, partition_id) })
+        FmError::from_return(unsafe {
+            (self.api.fm_deactivate_fabric_partition)(self.handle, partition_id)
+        })
     }
 
     pub fn set_activated_partitions(&self, ids: &[u32]) -> Result<(), FmError> {
@@ -200,19 +219,23 @@ impl FmConnection {
         list.version = ffi::FmActivatedFabricPartitionList::version();
         list.num_partitions = ids.len() as u32;
         list.partition_ids[..ids.len()].copy_from_slice(ids);
-        FmError::from_return(unsafe { ffi::fmSetActivatedFabricPartitions(self.handle, &mut list) })
+        FmError::from_return(unsafe {
+            (self.api.fm_set_activated_fabric_partitions)(self.handle, &mut list)
+        })
     }
 
     pub fn get_nvlink_failed_devices(&self) -> Result<types::NvlinkFailedDevices, FmError> {
         let mut devices = unsafe { std::mem::zeroed::<ffi::FmNvlinkFailedDevices>() };
         devices.version = ffi::FmNvlinkFailedDevices::version();
-        FmError::from_return(unsafe { ffi::fmGetNvlinkFailedDevices(self.handle, &mut devices) })?;
+        FmError::from_return(unsafe {
+            (self.api.fm_get_nvlink_failed_devices)(self.handle, &mut devices)
+        })?;
         Ok(types::NvlinkFailedDevices::from(&devices))
     }
 }
 
-impl Drop for FmConnection {
+impl Drop for FmConnection<'_> {
     fn drop(&mut self) {
-        unsafe { ffi::fmDisconnect(self.handle) };
+        unsafe { (self.api.fm_disconnect)(self.handle) };
     }
 }

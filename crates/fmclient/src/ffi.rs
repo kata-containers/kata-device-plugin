@@ -4,6 +4,8 @@
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint};
 
+use libloading::Library;
+
 pub const FM_MAX_STR_LENGTH: usize = 256;
 pub const FM_UUID_BUFFER_SIZE: usize = 80;
 pub const FM_DEVICE_PCI_BUS_ID_BUFFER_SIZE: usize = 32;
@@ -173,34 +175,87 @@ impl FmUnsupportedFabricPartitionList {
     }
 }
 
-#[link(name = "nvfm")]
-extern "C" {
-    pub fn fmLibInit() -> FmReturn;
-    pub fn fmLibShutdown() -> FmReturn;
-    pub fn fmConnect(params: *mut FmConnectParams, handle: *mut FmHandle) -> FmReturn;
-    pub fn fmDisconnect(handle: FmHandle) -> FmReturn;
-    pub fn fmGetSupportedFabricPartitions(
-        handle: FmHandle,
-        list: *mut FmFabricPartitionList,
-    ) -> FmReturn;
-    pub fn fmActivateFabricPartition(handle: FmHandle, partition_id: c_uint) -> FmReturn;
-    pub fn fmActivateFabricPartitionWithVFs(
-        handle: FmHandle,
-        partition_id: c_uint,
-        vf_list: *mut FmPciDevice,
-        num_vfs: c_uint,
-    ) -> FmReturn;
-    pub fn fmDeactivateFabricPartition(handle: FmHandle, partition_id: c_uint) -> FmReturn;
-    pub fn fmSetActivatedFabricPartitions(
-        handle: FmHandle,
-        list: *mut FmActivatedFabricPartitionList,
-    ) -> FmReturn;
-    pub fn fmGetNvlinkFailedDevices(
-        handle: FmHandle,
-        devices: *mut FmNvlinkFailedDevices,
-    ) -> FmReturn;
-    pub fn fmGetUnsupportedFabricPartitions(
-        handle: FmHandle,
-        list: *mut FmUnsupportedFabricPartitionList,
-    ) -> FmReturn;
+/// The library's soname, as the SDK package installs it.
+pub const LIBRARY: &str = "libnvfm.so.1";
+
+/// libnvfm's entry points, resolved when the library is loaded.  The
+/// signatures are the SDK's declarations in nv_fm_agent.h.
+pub struct Api {
+    pub fm_lib_init: unsafe extern "C" fn() -> FmReturn,
+    pub fm_lib_shutdown: unsafe extern "C" fn() -> FmReturn,
+    pub fm_connect: unsafe extern "C" fn(*mut FmConnectParams, *mut FmHandle) -> FmReturn,
+    pub fm_disconnect: unsafe extern "C" fn(FmHandle) -> FmReturn,
+    pub fm_get_supported_fabric_partitions:
+        unsafe extern "C" fn(FmHandle, *mut FmFabricPartitionList) -> FmReturn,
+    pub fm_activate_fabric_partition: unsafe extern "C" fn(FmHandle, c_uint) -> FmReturn,
+    pub fm_activate_fabric_partition_with_vfs:
+        unsafe extern "C" fn(FmHandle, c_uint, *mut FmPciDevice, c_uint) -> FmReturn,
+    pub fm_deactivate_fabric_partition: unsafe extern "C" fn(FmHandle, c_uint) -> FmReturn,
+    pub fm_set_activated_fabric_partitions:
+        unsafe extern "C" fn(FmHandle, *mut FmActivatedFabricPartitionList) -> FmReturn,
+    pub fm_get_nvlink_failed_devices:
+        unsafe extern "C" fn(FmHandle, *mut FmNvlinkFailedDevices) -> FmReturn,
+    pub fm_get_unsupported_fabric_partitions:
+        unsafe extern "C" fn(FmHandle, *mut FmUnsupportedFabricPartitionList) -> FmReturn,
+    /// Dropped last: the pointers above point into it.
+    _library: Library,
+}
+
+impl Api {
+    /// Load the library and resolve every entry point, so a missing or
+    /// mismatched SDK is one error at startup and never a crash mid-call.
+    pub fn load() -> Result<Self, libloading::Error> {
+        // SAFETY: loading runs libnvfm's constructors, which set up nothing
+        // this process must sequence against; the SDK's own initializer is
+        // fmLibInit, called explicitly.
+        let library = unsafe { Library::new(LIBRARY) }?;
+        macro_rules! entry {
+            ($name:literal) => {
+                // SAFETY: the pointer type is the SDK's declaration of the
+                // symbol in nv_fm_agent.h.
+                *unsafe { library.get($name) }?
+            };
+        }
+        let fm_lib_init = entry!(b"fmLibInit\0");
+        let fm_lib_shutdown = entry!(b"fmLibShutdown\0");
+        let fm_connect = entry!(b"fmConnect\0");
+        let fm_disconnect = entry!(b"fmDisconnect\0");
+        let fm_get_supported_fabric_partitions = entry!(b"fmGetSupportedFabricPartitions\0");
+        let fm_activate_fabric_partition = entry!(b"fmActivateFabricPartition\0");
+        let fm_activate_fabric_partition_with_vfs = entry!(b"fmActivateFabricPartitionWithVFs\0");
+        let fm_deactivate_fabric_partition = entry!(b"fmDeactivateFabricPartition\0");
+        let fm_set_activated_fabric_partitions = entry!(b"fmSetActivatedFabricPartitions\0");
+        let fm_get_nvlink_failed_devices = entry!(b"fmGetNvlinkFailedDevices\0");
+        let fm_get_unsupported_fabric_partitions = entry!(b"fmGetUnsupportedFabricPartitions\0");
+        Ok(Self {
+            fm_lib_init,
+            fm_lib_shutdown,
+            fm_connect,
+            fm_disconnect,
+            fm_get_supported_fabric_partitions,
+            fm_activate_fabric_partition,
+            fm_activate_fabric_partition_with_vfs,
+            fm_deactivate_fabric_partition,
+            fm_set_activated_fabric_partitions,
+            fm_get_nvlink_failed_devices,
+            fm_get_unsupported_fabric_partitions,
+            _library: library,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every entry point resolves where the SDK is installed; without it
+    /// there is nothing to check, and the test says so instead of failing
+    /// on a host that has no Fabric Manager.
+    #[test]
+    fn the_entry_points_resolve_where_the_library_is() {
+        match Api::load() {
+            Ok(_) => {}
+            Err(e) => eprintln!("skipped, {LIBRARY} is not loadable here: {e}"),
+        }
+    }
 }

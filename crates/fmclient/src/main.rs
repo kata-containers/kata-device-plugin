@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use pcilibs_rs::fabric;
+use kata_fabric_api as fabric;
 
 use fm::{FmAddress, FmConnection, FmLib};
 
@@ -27,6 +27,15 @@ enum OutputFormat {
 const VERSION: &str = "2.0.0";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_TIMEOUT_MS: u32 = 1000;
+/// The Service VM's guest CID when the runtime sets it deterministically
+/// (kata runtime-rs `vsock_cid`): the first slot of the range the runtime
+/// reserves for configured CIDs, so a publisher on the host dials a known
+/// address.  One Service VM per node and vsock is node-local, so every node
+/// uses the same number.
+const SERVICE_VM_CID: u32 = 3;
+/// Fabric Manager's vsock port, its `FM_CMD_VSOCK_PORT_NUMBER` default; the
+/// client side of `FM_CMD_VSOCK_CID=VMADDR_CID_ANY` in the Service VM.
+const FM_VSOCK_PORT: u32 = 1447971919;
 
 #[derive(Parser)]
 #[command(version = VERSION, about = "NVIDIA Fabric Manager client")]
@@ -214,13 +223,9 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
 
     let service_vm;
     let address = if let Some(ref vsock) = cli.vsock {
-        service_vm = vsock.clone().unwrap_or_else(|| {
-            format!(
-                "{}:{}",
-                pcilibs_rs::fabric::SERVICE_VM_CID,
-                pcilibs_rs::fabric::FM_VSOCK_PORT
-            )
-        });
+        service_vm = vsock
+            .clone()
+            .unwrap_or_else(|| format!("{SERVICE_VM_CID}:{FM_VSOCK_PORT}"));
         FmAddress::Vsock(&service_vm)
     } else if let Some(ref path) = cli.unix_socket {
         FmAddress::Unix(path)
@@ -298,7 +303,7 @@ fn target(cli: &Cli) -> Option<publish::Target> {
 /// A publish that fails after a partition changed exits non-zero: the
 /// change is in Fabric Manager and the node does not know yet.
 fn publish_view(
-    conn: &FmConnection,
+    conn: &FmConnection<'_>,
     target: &publish::Target,
     unit: &fabric::Unit,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -344,5 +349,33 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IN_BAND: &str = include_str!("../deploy/service-vm.yaml");
+    const OUT_OF_BAND: &str = include_str!("../deploy/service-vm-out-of-band.yaml");
+
+    /// The manifests cannot import the constants, so they repeat them;
+    /// these keep the copies equal.
+    #[test]
+    fn the_out_of_band_manifest_carries_the_contract_cid() {
+        let annotation =
+            format!("io.katacontainers.config.hypervisor.vsock_cid: \"{SERVICE_VM_CID}\"");
+        assert!(OUT_OF_BAND.contains(&annotation), "{annotation}");
+        assert!(OUT_OF_BAND.contains("nvrc.fm.vsock=on"));
+        // FM's default port is dialed; the manifest must not override it.
+        assert!(!OUT_OF_BAND.contains(&FM_VSOCK_PORT.to_string()));
+    }
+
+    #[test]
+    fn the_in_band_manifest_opens_no_vsock_listener() {
+        assert!(!IN_BAND.contains("hypervisor.vsock_cid"));
+        assert!(!IN_BAND.contains("nvrc.fm.vsock"));
+        // The container idles; fmclient runs through kubectl exec.
+        assert!(IN_BAND.contains(r#"command: ["sleep", "infinity"]"#));
     }
 }

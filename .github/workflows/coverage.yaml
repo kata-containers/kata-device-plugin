@@ -46,8 +46,10 @@ jobs:
   coverage:
     name: Code coverage
     env:
-      # Files the gate skips: the plugin's process wiring in main.rs.
-      IGNORE: 'src/main\.rs$'
+      # Files the gate skips: the two binaries' process wiring in main.rs,
+      # and fmclient's calls into the Fabric Manager SDK, which CI does not
+      # have.
+      IGNORE: 'src/main\.rs$|crates/fmclient/src/(ffi|fm)\.rs$'
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
