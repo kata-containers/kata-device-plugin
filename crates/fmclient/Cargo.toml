@@ -1,0 +1,31 @@
+[package]
+name = "fmclient"
+version = "2.0.0"
+edition = "2021"
+
+[[bin]]
+name = "fmclient"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# The fabric view's schema lives with its consumer, kata-device-plugin, in
+# pcilibs-rs; this client only fills it from the FM SDK and publishes it with
+# the generated stubs.  No crates.io release yet; pinned to the fabric-vsock
+# head.
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "174983c", default-features = false, features = ["fabric-grpc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# dup/dup2 on the standard descriptors, see claim_stdout.
+libc = "0.2"
+# The Publish call to kata-device-plugin; tonic's own transport dials TCP,
+# the unix socket goes through a connector.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tonic = "0.14"
+tower = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"

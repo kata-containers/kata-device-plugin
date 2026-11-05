@@ -1,0 +1,32 @@
+# The Service VM for out-of-band operation: the host activates partitions
+# over vsock and fmclient publishes the view to the plugin's host socket, so
+# the container only holds the fabric.  Needs kata runtime-rs with
+# `vsock_cid` and NVRC with `nvrc.fm.vsock`.  The CID is pcilibs-rs
+# fabric::SERVICE_VM_CID; a test keeps the two in step.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvswitch-service-vm
+  namespace: kata-system
+spec:
+  selector:
+    matchLabels:
+      app: nvswitch-service-vm
+  template:
+    metadata:
+      labels:
+        app: nvswitch-service-vm
+      annotations:
+        io.katacontainers.config.hypervisor.vsock_cid: "3"
+        io.katacontainers.config.hypervisor.kernel_params: "nvrc.fm.vsock=on"
+    spec:
+      runtimeClassName: kata-qemu-nvidia-gpu-runtime-rs
+      nodeSelector:
+        kata.feature.node.kubernetes.io/managed-fabric: "true"
+      containers:
+        - name: fabric-holder
+          image: ghcr.io/zvonkok/fmclient:615
+          command: ["sleep", "infinity"]
+          resources:
+            limits:
+              nvidia.com/nvswitch-fabric: 1
