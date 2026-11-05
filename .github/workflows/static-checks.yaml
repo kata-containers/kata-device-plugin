@@ -176,7 +176,9 @@ jobs:
         uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-deny --locked
-      - run: cargo deny check
+      # Every workspace member is a root: the plugin alone would leave
+      # fmclient's dependencies unaudited.
+      - run: cargo deny --workspace check
 
   # Detect unused dependencies in Cargo.toml
   unused-deps:
