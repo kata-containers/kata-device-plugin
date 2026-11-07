@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use container_device_interface::specs::config::Spec;
 use kata_device_plugin::dp::v1beta1::{
     device_plugin_client::DevicePluginClient,
     registration_server::{Registration, RegistrationServer},
@@ -15,7 +16,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use pcilibs_rs::testfs::add as add_dev;
+use pcilibs_rs::testfs::{add as add_dev, add_connectx};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -731,9 +732,10 @@ async fn grpc_stubs_respond() {
 }
 
 #[tokio::test]
-async fn gpu_and_nvswitch_filtered_by_pci_class() {
-    // A mixed node: 2 GPUs, 3 NVSwitches, and a VFIO-bound NIC that matches
-    // no RESOURCES row and must not be advertised anywhere.
+async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
+    // A mixed node: 2 GPUs, 3 NVSwitch chips forming one fabric, and a
+    // VFIO-bound NIC that matches no RESOURCES row and must not be
+    // advertised anywhere.
     let vfio = TempDir::new().unwrap();
     for i in 0..2 {
         add_dev(vfio.path(), i, "0x10de", "0x2330", "0x030200");
@@ -743,21 +745,85 @@ async fn gpu_and_nvswitch_filtered_by_pci_class() {
     }
     add_dev(vfio.path(), 5, "0x15b3", "0x101e", "0x020000");
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
 
-    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch.sock", 3)] {
+    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch-fabric.sock", 1)] {
         let (_stream, resp) = node.snapshot(sock).await;
         assert_eq!(resp.devices.len(), expected, "{sock}");
     }
 
     // Each resource's CDI spec holds only its own devices.
     let gpu = node.spec("kata.nvidia.com-gpu.yaml").unwrap();
-    let sw = node.spec("kata.nvidia.com-nvswitch.yaml").unwrap();
+    let sw = node.spec("kata.nvidia.com-nvswitch-fabric.yaml").unwrap();
     assert!(gpu.contains("devices/vfio0") && gpu.contains("devices/vfio1"));
     assert!(sw.contains("devices/vfio2") && sw.contains("devices/vfio4"));
     assert!(!gpu.contains("devices/vfio2") && !sw.contains("devices/vfio0"));
     // The NIC appears in neither.
     assert!(!gpu.contains("devices/vfio5") && !sw.contains("devices/vfio5"));
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn management_pfs_are_served_as_one_nvswitch_fabric() {
+    // HGX B200/B300: the NVSwitches are reached through the management
+    // ConnectX, whose PFs are what the Service VM is given.  Two of the four
+    // carry the VPD marker, all four belong, and they are one fabric, so the
+    // Service VM requests nvidia.com/nvswitch-fabric: 1 and gets every
+    // function.  A data-path ConnectX of the same vendor and class,
+    // VFIO-bound for some other purpose, must not be advertised.
+    let vfio = fake_vfio(2);
+    for (n, function) in [(2, 0), (3, 1), (4, 2), (5, 3)] {
+        add_connectx(
+            vfio.path(),
+            n,
+            &format!("0000:05:00.{function}"),
+            function < 2,
+        );
+    }
+    add_connectx(vfio.path(), 6, "0000:18:00.0", false);
+
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
+
+    let (_gpu_stream, gpus) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(gpus.devices.len(), 2);
+    let (_fabric_stream, fabric) = node.snapshot("kata-nvswitch-fabric.sock").await;
+    assert_eq!(fabric.devices.len(), 1);
+
+    let spec: Spec =
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-nvswitch-fabric.yaml").unwrap())
+            .unwrap();
+    assert_eq!(spec.devices.len(), 1);
+    let nodes = spec.devices[0]
+        .container_edits
+        .device_nodes
+        .as_ref()
+        .unwrap();
+    let cdevs: Vec<&str> = nodes
+        .iter()
+        .map(|node| node.path.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(cdevs, ["vfio2", "vfio3", "vfio4", "vfio5"]);
+    assert!(!node
+        .spec("kata.nvidia.com-gpu.yaml")
+        .unwrap()
+        .contains("devices/vfio2"));
+
+    let resp = node
+        .client("kata-nvswitch-fabric.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["0".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.container_responses[0].cdi_devices[0].name,
+        "nvidia.com/nvswitch-fabric=0"
+    );
 
     node.shutdown().await;
 }
