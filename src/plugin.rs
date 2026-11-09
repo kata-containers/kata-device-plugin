@@ -23,13 +23,13 @@ use crate::dp::v1beta1::{
     RegisterRequest,
 };
 
-/// Where the kubelet serves its registration socket and scans for plugin
-/// sockets.  Not configurable — the device plugin API decides.
+/// Container path for the kubelet registration socket and plugin sockets.
+/// Helm maps the distribution's host directory here.
 /// Tests inject a temp dir via `DeviceServer::new` instead.
 pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
 
-/// Where the host CDI registry lives; the Kata shim reads it at
-/// SandboxCreate.  A runtime contract, not configuration.
+/// Container path for the host CDI registry; Helm maps the directory
+/// searched by containerd and the Kata shim here.
 pub const CDI_DIR: &str = "/var/run/cdi";
 
 /// How often ListAndWatch re-scans /dev/vfio/devices/.
