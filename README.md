@@ -30,7 +30,8 @@ aggregates or partitions what the node declares.
 
 For each present resource the plugin:
 
-1. writes a host CDI spec mapping device indices to IOMMUFD cdev paths —
+1. writes a host CDI spec mapping device indices to the IOMMUFD cdev paths
+   of each device, one node per bound function —
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,

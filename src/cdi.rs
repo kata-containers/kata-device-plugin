@@ -5,7 +5,7 @@ use container_device_interface::spec::validate_spec;
 use container_device_interface::specs::config::{ContainerEdits, Device, DeviceNode, Spec};
 use tracing::info;
 
-use pcilibs_rs::IommufdDev;
+use crate::vfio;
 
 /// Path of the CDI spec file for `resource_name` inside `cdi_dir`:
 /// "nvidia.com/gpu" → `<cdi_dir>/kata.nvidia.com-gpu.yaml`.  The `kata.`
@@ -17,11 +17,12 @@ pub fn spec_path(cdi_dir: &Path, resource_name: &str) -> PathBuf {
 /// Write the host CDI spec mapping index `i` → `devices[i]` — the same IDs
 /// the plugin advertises.  Kata's shim reads this registry at SandboxCreate
 /// to resolve `nvidia.com/gpu=0` → `/dev/vfio/devices/vfio<N>` for VFIO
-/// passthrough into the hypervisor.  The CDI `kind` is the extended-resource
-/// name itself.
+/// passthrough into the hypervisor.  Every bound function of a device is a
+/// device node, so a multi-function PCI device is injected whole.  The CDI
+/// `kind` is the extended-resource name itself.
 pub fn write_cdi_spec(
     resource_name: &str,
-    devices: &[IommufdDev],
+    devices: &[vfio::Device],
     cdi_dir: &Path,
 ) -> anyhow::Result<()> {
     if devices.is_empty() {
@@ -41,12 +42,16 @@ pub fn write_cdi_spec(
             .map(|(idx, dev)| Device {
                 name: idx.to_string(),
                 container_edits: ContainerEdits {
-                    device_nodes: Some(vec![DeviceNode {
-                        path: dev.path.to_string_lossy().into_owned(),
-                        r#type: Some("c".to_owned()),
-                        permissions: Some("rw".to_owned()),
-                        ..Default::default()
-                    }]),
+                    device_nodes: Some(
+                        dev.iter()
+                            .map(|function| DeviceNode {
+                                path: function.path.to_string_lossy().into_owned(),
+                                r#type: Some("c".to_owned()),
+                                permissions: Some("rw".to_owned()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -87,10 +92,9 @@ pub fn write_cdi_spec(
 mod tests {
     use super::*;
     use crate::vfio::{self, testfs, Naming, Sysfs};
-    use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
 
-    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<IommufdDev> {
+    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<vfio::Device> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }

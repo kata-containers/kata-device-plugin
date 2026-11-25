@@ -48,6 +48,8 @@ Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consump
 
 The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
 
+The unit of advertisement is the smallest thing a consumer can take. For GPUs that is the PCI device: a multi-function device is one device whose CDI entry carries every function, because no consumer can take a function without its siblings. Several PCI devices are never grouped.
+
 ### Why the plugin does not bind VFIO devices
 
 Binding a device is a reconfiguration of the infrastructure. The workload cluster is read-only toward the infrastructure; reconfiguration authority lives in the admin cluster. Placing a component that can bind devices inside the workload cluster would put infrastructure control next to the untrusted workloads it is meant to contain (boundary document, ADR 1000). The device plugin only declares what already exists.

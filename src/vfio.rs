@@ -3,6 +3,12 @@ use std::path::Path;
 
 pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
+/// One advertised device: the bound functions of one PCI device, in cdev
+/// order.  This is both the unit the kubelet schedules and the CDI device the
+/// shim injects.  Functions are never advertised separately, because no
+/// consumer can take one without its siblings.
+pub type Device = Vec<IommufdDev>;
+
 /// How advertised resource names are derived (--resource-naming flag).
 #[derive(Clone, Copy, Debug)]
 pub enum Naming {
@@ -51,6 +57,15 @@ pub struct Resource {
     pub class_prefix: u16,
 }
 
+impl Resource {
+    /// PCI identity match.
+    fn matches(&self, dev: &IommufdDev) -> bool {
+        dev.vendor == self.vendor
+            && dev.class_prefix() == self.class_prefix
+            && self.device.is_none_or(|d| dev.device == d)
+    }
+}
+
 /// Everything this plugin can advertise, first match wins — put curated
 /// alias rows (exact device id) above their class fallback.  A resource is
 /// advertised iff matching devices are VFIO-bound; supporting a new device
@@ -70,31 +85,37 @@ pub const RESOURCES: &[Resource] = &[
     },
 ];
 
-/// Enumerate all IOMMUFD cdevs and group them by advertised resource name.
-/// Rows are first-match-wins per device, so every cdev lands in exactly one
-/// resource; devices within a name keep numeric cdev order, which fixes the
-/// advertised device IDs / CDI spec indices.
-pub fn discover(
-    vfio_dir: &Path,
-    sysfs: &Sysfs,
-    naming: Naming,
-) -> BTreeMap<String, Vec<IommufdDev>> {
-    let mut map: BTreeMap<String, Vec<IommufdDev>> = BTreeMap::new();
+/// Enumerate all IOMMUFD cdevs and group them into advertised devices by
+/// resource name.  Rows are first-match-wins per cdev, so every cdev lands
+/// in exactly one resource.  Within a name the devices are ordered by PCI
+/// address, which survives a reboot where cdev numbers do not; that order
+/// fixes the advertised device IDs / CDI spec indices.
+pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Device>> {
+    // Name, then PCI slot, then the slot's bound functions.  No row has a
+    // multi-function PCI device today; the slot is the principle
+    // ARCHITECTURE.md states, functions are never separate devices, and the
+    // order key.
+    let mut by_slot: BTreeMap<String, BTreeMap<String, Device>> = BTreeMap::new();
     for dev in pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs) {
-        let Some(row) = RESOURCES.iter().find(|r| {
-            dev.vendor == r.vendor
-                && dev.class_prefix() == r.class_prefix
-                && r.device.is_none_or(|d| dev.device == d)
-        }) else {
+        let Some(row) = RESOURCES.iter().find(|r| r.matches(&dev)) else {
             continue;
         };
         let name = match naming {
             Naming::Alias => row.name.to_owned(),
             Naming::Sku => sku_name(row, &dev),
         };
-        map.entry(name).or_default().push(dev);
+        let slot = pcilibs_rs::slot(&dev.bdf).to_owned();
+        by_slot
+            .entry(name)
+            .or_default()
+            .entry(slot)
+            .or_default()
+            .push(dev);
     }
-    map
+    by_slot
+        .into_iter()
+        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .collect()
 }
 
 /// 10de:2330 → "nvidia.com/GH100_H100_SXM5_80GB"; ids the PCI database does
@@ -169,8 +190,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn nums(devs: &[IommufdDev]) -> Vec<u32> {
-        devs.iter().map(|d| d.num).collect()
+    /// Cdev numbers per advertised device.
+    fn nums(devices: &[Device]) -> Vec<Vec<u32>> {
+        devices
+            .iter()
+            .map(|device| device.iter().map(|cdev| cdev.num).collect())
+            .collect()
     }
 
     #[test]
@@ -184,9 +209,9 @@ mod tests {
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![7, 42]);
-        assert!(map["nvidia.com/gpu"][0].path.ends_with("devices/vfio7"));
-        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![9]);
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![7], vec![42]]);
+        assert!(map["nvidia.com/gpu"][0][0].path.ends_with("devices/vfio7"));
+        assert_eq!(nums(&map["nvidia.com/nvswitch"]), vec![vec![9]]);
     }
 
     #[test]
@@ -205,7 +230,7 @@ mod tests {
             "unexpected SKU name: {name}"
         );
         assert!(!name.contains(['[', ']', ' ']), "unsanitized: {name}");
-        assert_eq!(nums(devs), vec![0, 1]);
+        assert_eq!(nums(devs), vec![vec![0], vec![1]]);
     }
 
     #[test]
@@ -248,17 +273,7 @@ mod tests {
             device: 0x1234,
             ..dev_h100.clone()
         };
-        let pick = |dev: &IommufdDev| {
-            CURATED
-                .iter()
-                .find(|r| {
-                    dev.vendor == r.vendor
-                        && dev.class_prefix() == r.class_prefix
-                        && r.device.is_none_or(|d| dev.device == d)
-                })
-                .unwrap()
-                .name
-        };
+        let pick = |dev: &IommufdDev| CURATED.iter().find(|r| r.matches(dev)).unwrap().name;
         assert_eq!(pick(&dev_h100), "nvidia.com/h100");
         assert_eq!(pick(&dev_other), "nvidia.com/gpu");
     }
