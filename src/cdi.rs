@@ -185,14 +185,53 @@ mod tests {
             testfs::add_nvswitch(root.path(), n);
         }
         let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
-            .remove("nvidia.com/nvswitch")
+            .remove("nvidia.com/nvswitch-fabric")
             .unwrap_or_default();
 
-        write_cdi_spec("nvidia.com/nvswitch", &devs, cdi_dir.path()).unwrap();
+        write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
 
         assert!(cdi_dir
             .path()
-            .join("kata.nvidia.com-nvswitch.yaml")
+            .join("kata.nvidia.com-nvswitch-fabric.yaml")
             .exists());
+    }
+
+    #[test]
+    fn fabric_is_one_cdi_device_with_a_node_per_function() {
+        // The B200/B300 management ConnectX: four PFs, one fabric.  The shim
+        // must inject all of them from one CDI name.
+        let root = TempDir::new().unwrap();
+        let cdi_dir = TempDir::new().unwrap();
+        for function in 0..4u32 {
+            testfs::add_connectx_cdev(
+                root.path(),
+                function,
+                &format!("0000:05:00.{function}"),
+                function < 2,
+            );
+        }
+        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
+            .remove("nvidia.com/nvswitch-fabric")
+            .unwrap_or_default();
+
+        write_cdi_spec("nvidia.com/nvswitch-fabric", &devs, cdi_dir.path()).unwrap();
+
+        let contents =
+            std::fs::read_to_string(cdi_dir.path().join("kata.nvidia.com-nvswitch-fabric.yaml"))
+                .unwrap();
+        let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
+        validate_spec(&spec).unwrap();
+        assert_eq!(spec.devices.len(), 1);
+        assert_eq!(spec.devices[0].name, "0");
+        let nodes = spec.devices[0]
+            .container_edits
+            .device_nodes
+            .as_ref()
+            .unwrap();
+        let cdevs: Vec<&str> = nodes
+            .iter()
+            .map(|node| node.path.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(cdevs, ["vfio0", "vfio1", "vfio2", "vfio3"]);
     }
 }
