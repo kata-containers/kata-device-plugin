@@ -156,11 +156,11 @@ pub(crate) mod testfs {
     /// An H100 SXM5 80GB: pci-ids 10de:2330, so SKU naming is exercised
     /// against the real database.
     pub fn add_gpu(root: &Path, n: u32) {
-        add(root, n, "0x10de", "0x2330", "0x030200");
+        add(root, n, 0x10de, 0x2330, 0x030200);
     }
 
     pub fn add_nvswitch(root: &Path, n: u32) {
-        add(root, n, "0x10de", "0x22a3", "0x068000");
+        add(root, n, 0x10de, 0x22a3, 0x068000);
     }
 }
 
@@ -180,7 +180,7 @@ mod tests {
         testfs::add_gpu(root.path(), 7);
         testfs::add_nvswitch(root.path(), 9);
         // A VFIO-bound NIC must not be advertised under any resource.
-        testfs::add(root.path(), 3, "0x15b3", "0x101e", "0x020000");
+        testfs::add(root.path(), 3, 0x15b3, 0x101e, 0x020000);
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn sku_mode_unknown_device_falls_back_to_row_name() {
         let root = TempDir::new().unwrap();
-        testfs::add(root.path(), 0, "0x10de", "0xdead", "0x030200");
+        testfs::add(root.path(), 0, 0x10de, 0xdead, 0x030200);
 
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
         assert_eq!(map.len(), 1);
@@ -239,6 +239,7 @@ mod tests {
         let dev_h100 = IommufdDev {
             num: 0,
             path: "/dev/vfio/devices/vfio0".into(),
+            bdf: "0000:01:00.0".to_owned(),
             vendor: 0x10de,
             device: 0x2330,
             class: 0x030200,
