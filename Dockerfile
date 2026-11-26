@@ -16,6 +16,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY proto/ proto/
 COPY src/ src/
+# Workspace members: cargo reads every member's manifest.
+COPY crates/ crates/
 
 RUN cargo build --release --locked
 
