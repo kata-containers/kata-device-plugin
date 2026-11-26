@@ -129,7 +129,7 @@ gh attestation verify "kata-device-plugin-${VERSION}.tgz" \
 
 The chart is the only deployment model.  It exposes only what varies per
 cluster (image, nodeSelector, tolerations, resources, resource naming,
-log filter); the security context and hostPath mounts are contracts, not
+log filter, fabric owner namespaces); the security context and hostPath mounts are contracts, not
 configuration, and are fixed in the template.
 
 The DaemonSet name includes both the release and component name, for example
@@ -144,6 +144,11 @@ Earlier charts named the DaemonSet after the release alone. To preserve an
 existing DaemonSet when upgrading, set `fullnameOverride` to that release name.
 Otherwise Helm replaces it with the new name, briefly interrupting device
 advertisement while the replacement pods start.
+
+`fabricOwnerNamespaces` names the namespaces whose pods may request
+`nvidia.com/nvswitch-fabric`. The chart's `ValidatingAdmissionPolicy` denies
+the request everywhere else (Kubernetes 1.30 or later); an empty list ships no
+policy. See [ARCHITECTURE.md](ARCHITECTURE.md), "Who may hold the fabric".
 
 The chart includes `index.json` so consumers can read the resource names,
 supported naming modes, and default chart image from a pinned chart release.

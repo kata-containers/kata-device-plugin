@@ -24,6 +24,12 @@ In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partition
 
 **The view.** The Fabric Manager client in the Service VM publishes the partition lists to the plugin's view service in one gRPC call, and the plugin keeps that view, on disk next to its token so a plugin restart keeps the node's capacity, until the next call or until the fabric changes hands. Only the fabric holder may publish: the fabric's Allocate injects an endpoint and a freshly minted token into that container's environment, the listener admits only that token, and a new holder's Allocate withdraws the view, since the partitions it described were the previous holder's. The plugin is a scheduling ledger and Fabric Manager is the enforcement point: a stale view sends a pod to GPUs whose fabric is not ready, where CUDA init fails, and cannot hand out another partition's GPUs. So the command that changes partitions publishes the result and exits; nothing stays connected. The schema is the `kata-fabric-api` crate in this repository.
 
+## Who may hold the fabric
+
+The fabric holder decides which GPUs share NVLink and publishes the view the node advertises. A tenant holding it can put its own GPUs and other tenants' into one partition, a cross-tenant data path, not a denial of service. The plugin cannot refuse a requester: the kubelet's Allocate names devices, not pods, and the plugin has no API access. A capacity of one is no protection either; a pending request wins the race when the Service VM restarts.
+
+The gate is admission. The chart ships a `ValidatingAdmissionPolicy` that denies `nvidia.com/nvswitch-fabric` in any pod outside the namespaces in `fabricOwnerNamespaces` (Kubernetes 1.30 or later). Tenants hold no verbs in the owner namespaces, so `kubectl exec` into the Service VM stays the owner's. When a node is dedicated to one tenant who runs their own Service VM, the owner namespace is that tenant's; the gate is the same.
+
 ## Out of scope: multi-node NVLink (IMEX)
 
 On GB200 NVL72 / GB300 / Vera Rubin, GPUs across nodes share memory over the NVLink fabric through the IMEX service. None of that concerns this plugin:
