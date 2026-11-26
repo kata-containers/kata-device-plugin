@@ -15,7 +15,7 @@
 //! result and exits; nothing stays connected.
 
 use std::io::{self, Read};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,10 @@ const VIEW_FILE: &str = "fabric-view.json";
 /// Where publishers reach the plugin: the pod's port, exposed on the node by
 /// the chart.  Fixed, like the kubelet's socket directory.
 pub const PORT: u16 = 9877;
+/// The node address the chart passes in from the downward API
+/// (`status.hostIP`).  The plugin advertises `http://<ip>:PORT` to the
+/// fabric holder; without it the holder gets a token and no endpoint.
+pub const HOST_IP_ENV: &str = "KATA_DEVICE_PLUGIN_HOST_IP";
 
 struct State {
     token: String,
@@ -130,6 +134,14 @@ impl View {
         state.current = Some(view);
         Ok(())
     }
+}
+
+/// The endpoint a publisher reaches this node at, from the node address the
+/// chart passes in; `None` when that is not an IP address.
+pub fn endpoint(host_ip: &str) -> Option<String> {
+    let ip: IpAddr = host_ip.trim().parse().ok()?;
+    // SocketAddr brackets an IPv6 address, as a URL authority requires.
+    Some(format!("http://{}", SocketAddr::new(ip, PORT)))
 }
 
 fn is_token(s: &str) -> bool {
@@ -355,6 +367,20 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, "").unwrap();
         assert!(View::load(&file.join("state")).is_err());
+    }
+
+    #[test]
+    fn the_endpoint_is_a_url_for_either_address_family() {
+        assert_eq!(
+            endpoint("10.0.0.7").unwrap(),
+            format!("http://10.0.0.7:{PORT}")
+        );
+        assert_eq!(
+            endpoint("fd00::7\n").unwrap(),
+            format!("http://[fd00::7]:{PORT}")
+        );
+        assert_eq!(endpoint(""), None);
+        assert_eq!(endpoint("node-1"), None);
     }
 
     #[tokio::test]

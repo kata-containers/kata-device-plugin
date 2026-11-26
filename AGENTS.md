@@ -24,7 +24,7 @@ Read [CLAUDE.md](CLAUDE.md) first. This file adds agent-specific constraints on 
 
 ## Testing
 
-Unit tests live next to the code (`vfio.rs`, `cdi.rs`); integration tests in `tests/server.rs` drive the gRPC server against a mock kubelet on unix sockets. Prefer integration tests that drive the gRPC server over unit tests that mock tonic internals.
+Unit tests live next to the code (`vfio.rs`, `cdi.rs`, `view.rs`); integration tests in `tests/server.rs` and `tests/fabric.rs`, with their fixtures in `tests/common`, drive the gRPC server against a mock kubelet on unix sockets. Prefer integration tests that drive the gRPC server over unit tests that mock tonic internals.
 
 ## Do not
 

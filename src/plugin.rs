@@ -11,8 +11,14 @@ use tonic::{Request, Response, Status};
 use tower::service_fn;
 use tracing::info;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use kata_fabric_api::{ENDPOINT_ENV, TOKEN_ENV};
+
 use crate::cdi;
 use crate::vfio::{self, Naming, Sysfs};
+use crate::view::View;
 
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -55,6 +61,13 @@ pub struct DeviceServer {
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
     endpoint_shutdown: CancellationToken,
+    /// Whether this server hands out the node's fabric, the one device whose
+    /// holder is the Service VM.  Decided once, from the RESOURCES row.
+    fabric: bool,
+    /// The fabric view, when the node runs the service.
+    view: Option<Arc<View>>,
+    /// Where the fabric holder publishes to, when the node address is known.
+    endpoint: Option<String>,
 }
 
 impl DeviceServer {
@@ -74,7 +87,46 @@ impl DeviceServer {
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
             endpoint_shutdown: CancellationToken::new(),
+            fabric: vfio::RESOURCES
+                .iter()
+                .any(|row| row.name == name && row.unit == vfio::Unit::Fabric),
+            view: None,
+            endpoint: None,
         }
+    }
+
+    /// Give the server the node's view.  The fabric's Allocate then hands
+    /// its holder `endpoint`, `http://<node ip>:<port>` or `None` when the
+    /// node address is unknown, and a fresh token.
+    pub fn with_view(mut self, view: Arc<View>, endpoint: Option<String>) -> Self {
+        self.view = Some(view);
+        self.endpoint = endpoint;
+        self
+    }
+
+    /// The environment the fabric's new holder publishes with.  Rotating the
+    /// token here is what makes the previous holder's copy stop working the
+    /// moment the fabric changes hands.  Every other resource injects
+    /// nothing.
+    fn publisher_env(&self) -> Result<HashMap<String, String>, Status> {
+        let Some(view) = self.view.as_ref().filter(|_| self.fabric) else {
+            return Ok(HashMap::new());
+        };
+        let token = view.rotate_token().map_err(|e| {
+            Status::unavailable(format!("fabric view token cannot be written: {e:#}"))
+        })?;
+        let mut envs = HashMap::from([(TOKEN_ENV.to_owned(), token)]);
+        match &self.endpoint {
+            Some(endpoint) => {
+                envs.insert(ENDPOINT_ENV.to_owned(), endpoint.clone());
+                info!(
+                    endpoint,
+                    "fabric allocated: holder gets endpoint and a fresh token"
+                );
+            }
+            None => info!("fabric allocated: holder gets a fresh token, no endpoint is known"),
+        }
+        Ok(envs)
     }
 
     /// This server's devices under the current scan: the discover() group
@@ -367,7 +419,10 @@ impl DevicePlugin for DeviceServer {
                 "CDI registry for {resource_name} is not writable: {e:#}"
             )));
         }
-        let mut responses = Vec::new();
+        // Every ID is checked before the fabric's token rotates: a request
+        // that fails, or asks for nothing, must not revoke the current
+        // holder's token.
+        let mut allocations = Vec::new();
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();
             for id in cr.devices_i_ds {
@@ -382,13 +437,28 @@ impl DevicePlugin for DeviceServer {
                     name: format!("{resource_name}={id}"),
                 });
             }
-            responses.push(ContainerAllocateResponse {
+            allocations.push(cdi_devices);
+        }
+        let envs = if allocations.iter().all(Vec::is_empty) {
+            HashMap::new()
+        } else {
+            self.publisher_env()?
+        };
+        // Only a container that receives a device gets the environment.
+        let container_responses = allocations
+            .into_iter()
+            .map(|cdi_devices| ContainerAllocateResponse {
+                envs: if cdi_devices.is_empty() {
+                    HashMap::new()
+                } else {
+                    envs.clone()
+                },
                 cdi_devices,
                 ..Default::default()
-            });
-        }
+            })
+            .collect();
         Ok(Response::new(AllocateResponse {
-            container_responses: responses,
+            container_responses,
         }))
     }
 

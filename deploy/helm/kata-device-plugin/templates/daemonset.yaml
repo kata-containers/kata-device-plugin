@@ -45,11 +45,18 @@ spec:
           args:
             - --resource-naming={{ .Values.resourceNaming }}
           {{- end }}
-          {{- with .Values.logFilter }}
           env:
+            # The node address the plugin advertises to the fabric holder,
+            # with the fabric view port below (see ARCHITECTURE.md, "Fabric
+            # partitions").
+            - name: KATA_DEVICE_PLUGIN_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- with .Values.logFilter }}
             - name: RUST_LOG
               value: {{ . | quote }}
-          {{- end }}
+            {{- end }}
 
           ports:
             # The fabric view service: the Service VM's Fabric Manager client

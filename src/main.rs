@@ -30,12 +30,14 @@ fn parse_naming() -> anyhow::Result<vfio::Naming> {
 fn spawn_server(
     name: &str,
     naming: vfio::Naming,
+    view: Option<&Arc<view::View>>,
+    endpoint: Option<&str>,
     shutdown: &CancellationToken,
     running: &Arc<Mutex<HashSet<String>>>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     info!(resource = %name, "starting plugin");
-    let server = DeviceServer::new(
+    let mut server = DeviceServer::new(
         name,
         naming,
         vfio::VFIO_DIR,
@@ -43,6 +45,9 @@ fn spawn_server(
         plugin::SOCKET_DIR,
         plugin::CDI_DIR,
     );
+    if let Some(view) = view {
+        server = server.with_view(view.clone(), endpoint.map(str::to_owned));
+    }
     let token = shutdown.clone();
     let label = name.to_owned();
     let set = running.clone();
@@ -93,6 +98,17 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Where the fabric holder publishes to.  Without the node address the
+    // holder still gets the token and can be pointed at the endpoint by hand.
+    let endpoint = std::env::var(view::HOST_IP_ENV)
+        .ok()
+        .and_then(|ip| view::endpoint(&ip));
+    if endpoint.is_none() {
+        tracing::warn!(
+            "{} is unset or not an IP address: the fabric holder gets a token but no endpoint",
+            view::HOST_IP_ENV
+        );
+    }
     if let Some(view) = &view {
         match view::bind().await {
             Ok(tcp) => {
@@ -127,7 +143,15 @@ async fn main() -> anyhow::Result<()> {
         }
         for name in desired {
             if !running.lock().unwrap().contains(&name) {
-                spawn_server(&name, naming, &shutdown, &running, &mut tasks);
+                spawn_server(
+                    &name,
+                    naming,
+                    view.as_ref(),
+                    endpoint.as_deref(),
+                    &shutdown,
+                    &running,
+                    &mut tasks,
+                );
             }
         }
         tokio::select! {
