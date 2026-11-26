@@ -4,10 +4,10 @@ version = "0.2.0-rc.2"
 edition = "2021"
 
 [workspace]
-# The plugin and the schema of its fabric view service, built from one lock
-# file so the service and the client that publishes to it are always of one
-# commit.
-members = ["crates/fabric-api"]
+# The plugin, the schema of its fabric view service, and the publisher that
+# fills that schema from the Fabric Manager SDK: one lock file, so the two
+# ends of the Publish call are always built from one commit.
+members = ["crates/fabric-api", "crates/fmclient"]
 
 [lib]
 name = "kata_device_plugin"

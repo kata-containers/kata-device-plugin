@@ -224,5 +224,6 @@ jobs:
       - run: cargo install cargo-bloat --locked
       - run: cargo bloat --locked --release --all-features -n 20
 
-  # No miri job (unlike NVRC): this crate forbids unsafe_code at compile
-  # time, and miri cannot interpret tempfile/tokio in the test harness.
+  # No miri job (unlike NVRC): the plugin forbids unsafe_code at compile
+  # time, fmclient's unsafe is its calls into libnvfm, which CI does not
+  # have, and miri cannot interpret tempfile/tokio in the test harness.
