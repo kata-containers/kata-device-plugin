@@ -369,6 +369,51 @@ async fn registers_with_kubelet_and_lists_devices() {
 }
 
 #[tokio::test]
+async fn t400_vga_is_allocated_without_its_audio_function() {
+    let vfio = TempDir::new().unwrap();
+    add_dev(vfio.path(), 0, "0x10de", "0x1ff2", "0x030000");
+    add_dev(vfio.path(), 1, "0x10de", "0x10fa", "0x040300");
+    let vga_path = vfio.path().join("devices/vfio0");
+    let node = Node::start(vfio, &["nvidia.com/gpu"]).await;
+
+    let (_stream, snapshot) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(snapshot.devices.len(), 1);
+    assert_eq!(snapshot.devices[0].id, "0");
+
+    let response = node
+        .client("kata-gpu.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["0".to_owned()],
+            }],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.container_responses.len(), 1);
+    let allocated = &response.container_responses[0].cdi_devices;
+    assert_eq!(allocated.len(), 1);
+    assert_eq!(allocated[0].name, "nvidia.com/gpu=0");
+
+    let spec: serde_json::Value =
+        serde_saphyr::from_str(&node.spec("kata.nvidia.com-gpu.yaml").unwrap()).unwrap();
+    assert_eq!(spec["cdiVersion"], "0.6.0");
+    assert_eq!(spec["kind"], "nvidia.com/gpu");
+    assert_eq!(spec["devices"].as_array().unwrap().len(), 1);
+    let nodes = spec["devices"][0]["containerEdits"]["deviceNodes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0]["path"].as_str().unwrap(),
+        vga_path.to_str().unwrap()
+    );
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
 async fn allocate_returns_cdi_device_names() {
     let node = Node::start(fake_vfio(2), &["nvidia.com/gpu"]).await;
 

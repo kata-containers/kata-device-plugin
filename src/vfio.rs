@@ -60,6 +60,12 @@ pub const RESOURCES: &[Resource] = &[
         name: "nvidia.com/gpu",
         vendor: 0x10de,
         device: None,
+        class_prefix: 0x0300, // VGA controller
+    },
+    Resource {
+        name: "nvidia.com/gpu",
+        vendor: 0x10de,
+        device: None,
         class_prefix: 0x0302, // 3D controller
     },
     Resource {

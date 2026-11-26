@@ -13,6 +13,7 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 
 | Resource | PCI identity |
 | --- | --- |
+| `nvidia.com/gpu` | `0x10de`, class `0x0300xx` (VGA controller) |
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
 | `nvidia.com/nvswitch` | `0x10de`, class `0x0680xx` (bridge: other) |
 
