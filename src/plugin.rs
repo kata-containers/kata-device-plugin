@@ -11,8 +11,14 @@ use tonic::{Request, Response, Status};
 use tower::service_fn;
 use tracing::info;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use kata_fabric_api::{ENDPOINT_ENV, TOKEN_ENV};
+
 use crate::cdi;
 use crate::vfio::{self, Naming, Sysfs};
+use crate::view::View;
 
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -55,6 +61,13 @@ pub struct DeviceServer {
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
     endpoint_shutdown: CancellationToken,
+    /// Whether this server hands out the node's fabric, the one device whose
+    /// holder is the Service VM.  Decided once, from the RESOURCES row.
+    fabric: bool,
+    /// The fabric view, when the node runs the service.
+    view: Option<Arc<View>>,
+    /// Where the fabric holder publishes to, when the node address is known.
+    endpoint: Option<String>,
 }
 
 impl DeviceServer {
@@ -74,12 +87,51 @@ impl DeviceServer {
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
             endpoint_shutdown: CancellationToken::new(),
+            fabric: vfio::RESOURCES
+                .iter()
+                .any(|row| row.name == name && row.unit == vfio::Unit::Fabric),
+            view: None,
+            endpoint: None,
         }
+    }
+
+    /// Give the server the node's view.  The fabric's Allocate then hands
+    /// its holder `endpoint`, `http://<node ip>:<port>` or `None` when the
+    /// node address is unknown, and a fresh token.
+    pub fn with_view(mut self, view: Arc<View>, endpoint: Option<String>) -> Self {
+        self.view = Some(view);
+        self.endpoint = endpoint;
+        self
+    }
+
+    /// The environment the fabric's new holder publishes with.  Rotating the
+    /// token here is what makes the previous holder's copy stop working the
+    /// moment the fabric changes hands.  Every other resource injects
+    /// nothing.
+    fn publisher_env(&self) -> Result<HashMap<String, String>, Status> {
+        let Some(view) = self.view.as_ref().filter(|_| self.fabric) else {
+            return Ok(HashMap::new());
+        };
+        let token = view.rotate_token().map_err(|e| {
+            Status::unavailable(format!("fabric view token cannot be written: {e:#}"))
+        })?;
+        let mut envs = HashMap::from([(TOKEN_ENV.to_owned(), token)]);
+        match &self.endpoint {
+            Some(endpoint) => {
+                envs.insert(ENDPOINT_ENV.to_owned(), endpoint.clone());
+                info!(
+                    endpoint,
+                    "fabric allocated: holder gets endpoint and a fresh token"
+                );
+            }
+            None => info!("fabric allocated: holder gets a fresh token, no endpoint is known"),
+        }
+        Ok(envs)
     }
 
     /// This server's devices under the current scan: the discover() group
     /// matching our resolved name.
-    fn my_devices(&self) -> Vec<vfio::IommufdDev> {
+    fn my_devices(&self) -> Vec<vfio::Entry> {
         vfio::discover(&self.device_dir, &self.sysfs, self.naming)
             .remove(&self.name)
             .unwrap_or_default()
@@ -186,12 +238,12 @@ impl DeviceServer {
         }
     }
 
-    /// Bring the on-disk CDI spec in line with `devs`: write it from this
+    /// Bring the on-disk CDI spec in line with `entries`: write it from this
     /// scan, or remove it when no devices remain.  Sync fs work runs off the
     /// async workers.  Callers decide the failure policy: the poller retries
     /// on the next tick, Allocate fails the RPC.
-    async fn sync_cdi_spec(&self, devs: &[vfio::IommufdDev]) -> anyhow::Result<()> {
-        if devs.is_empty() {
+    async fn sync_cdi_spec(&self, entries: &[vfio::Entry]) -> anyhow::Result<()> {
+        if entries.is_empty() {
             let cdi_file = cdi::spec_path(&self.cdi_dir, &self.name);
             match tokio::fs::remove_file(&cdi_file).await {
                 Ok(()) => Ok(()),
@@ -200,9 +252,9 @@ impl DeviceServer {
             }
         } else {
             let name = self.name.clone();
-            let devs = devs.to_vec();
+            let entries = entries.to_vec();
             let dir = self.cdi_dir.clone();
-            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(&name, &devs, &dir))
+            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(&name, &entries, &dir))
                 .await
                 .context("CDI spec write task")?
         }
@@ -273,8 +325,8 @@ impl DevicePlugin for DeviceServer {
             // must retry next tick without re-sending an identical device
             // list every 5s (kubelet churn); a device change must reach the
             // kubelet even while the CDI registry is briefly unwritable.
-            let mut sent: Option<Vec<u32>> = None;
-            let mut synced: Option<Vec<u32>> = None;
+            let mut sent: Option<Vec<(String, Vec<u32>)>> = None;
+            let mut synced: Option<Vec<(String, Vec<u32>)>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
                 // set never changes again — otherwise this task would poll
@@ -283,34 +335,41 @@ impl DevicePlugin for DeviceServer {
                     break;
                 }
 
-                let vfio_devs = server.my_devices();
-                // Compare the backing cdev numbers, not the advertised Device
-                // list: IDs are just indices 0..n, so a same-count swap
-                // (vfio7 gone, vfio9 new) would look identical to the kubelet
-                // while the CDI spec's index → cdev mapping went stale.
-                let nums: Vec<u32> = vfio_devs.iter().map(|d| d.num).collect();
+                let entries = server.my_devices();
+                // The key is every device's ID with the cdev numbers behind
+                // it: an ID names a slot and stays while the functions under
+                // it change (vfio7 gone, vfio9 new), and the CDI spec must
+                // follow those.
+                let key: Vec<(String, Vec<u32>)> = entries
+                    .iter()
+                    .map(|entry| {
+                        let nums = entry.device.iter().map(|cdev| cdev.num).collect();
+                        (entry.id.clone(), nums)
+                    })
+                    .collect();
 
-                if Some(&nums) != synced.as_ref() {
-                    match server.sync_cdi_spec(&vfio_devs).await {
-                        Ok(()) => synced = Some(nums.clone()),
+                if Some(&key) != synced.as_ref() {
+                    match server.sync_cdi_spec(&entries).await {
+                        Ok(()) => synced = Some(key.clone()),
                         Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
                     }
                 }
 
-                if Some(&nums) != sent.as_ref() {
+                if Some(&key) != sent.as_ref() {
                     info!(
-                        count = nums.len(),
+                        count = key.len(),
                         resource = %server.name,
                         "device list changed"
                     );
-                    let devices = (0..nums.len())
-                        .map(|idx| Device {
-                            id: idx.to_string(),
+                    let devices = entries
+                        .iter()
+                        .map(|entry| Device {
+                            id: entry.id.clone(),
                             health: "Healthy".to_owned(),
                             topology: None,
                         })
                         .collect();
-                    sent = Some(nums);
+                    sent = Some(key);
                     tokio::select! {
                         _ = server.endpoint_shutdown.cancelled() => break,
                         result = tx.send(Ok(ListAndWatchResponse { devices })) => {
@@ -350,40 +409,56 @@ impl DevicePlugin for DeviceServer {
         // The device set can shrink between scheduling and Allocate.  Check
         // the requested IDs against a fresh enumeration so a stale ID fails
         // loudly here instead of as an unresolvable CDI name in the shim.
-        let devs = self.my_devices();
-        let present = devs.len();
+        let entries = self.my_devices();
         // The names below only work if the shim can resolve them at
         // SandboxCreate.  Sync the spec from the very enumeration we validate
         // against; if the CDI registry can't be written, fail the RPC now
         // instead of succeeding and producing an opaque runtime failure.
-        if let Err(e) = self.sync_cdi_spec(&devs).await {
+        if let Err(e) = self.sync_cdi_spec(&entries).await {
             return Err(Status::unavailable(format!(
                 "CDI registry for {resource_name} is not writable: {e:#}"
             )));
         }
-        let mut responses = Vec::new();
+        // Every ID is checked before the fabric's token rotates: a request
+        // that fails, or asks for nothing, must not revoke the current
+        // holder's token.
+        let mut allocations = Vec::new();
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();
             for id in cr.devices_i_ds {
-                match id.parse::<usize>() {
-                    Ok(idx) if idx < present => cdi_devices.push(CdiDevice {
-                        name: format!("{resource_name}={id}"),
-                    }),
-                    _ => {
-                        return Err(Status::not_found(format!(
-                            "device {id} of {resource_name} is no longer present \
-                             ({present} devices bound)"
-                        )))
-                    }
+                if !entries.iter().any(|entry| entry.id == id) {
+                    return Err(Status::not_found(format!(
+                        "device {id} of {resource_name} is no longer present \
+                         ({} devices bound)",
+                        entries.len()
+                    )));
                 }
+                cdi_devices.push(CdiDevice {
+                    name: format!("{resource_name}={id}"),
+                });
             }
-            responses.push(ContainerAllocateResponse {
+            allocations.push(cdi_devices);
+        }
+        let envs = if allocations.iter().all(Vec::is_empty) {
+            HashMap::new()
+        } else {
+            self.publisher_env()?
+        };
+        // Only a container that receives a device gets the environment.
+        let container_responses = allocations
+            .into_iter()
+            .map(|cdi_devices| ContainerAllocateResponse {
+                envs: if cdi_devices.is_empty() {
+                    HashMap::new()
+                } else {
+                    envs.clone()
+                },
                 cdi_devices,
                 ..Default::default()
-            });
-        }
+            })
+            .collect();
         Ok(Response::new(AllocateResponse {
-            container_responses: responses,
+            container_responses,
         }))
     }
 

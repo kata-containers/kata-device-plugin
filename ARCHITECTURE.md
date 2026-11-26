@@ -2,17 +2,33 @@
 
 ## What this plugin does and does not do
 
-This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` (and `nvidia.com/nvswitch` where NVSwitch devices are bound). It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
+This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passthrough devices on a node, classifies them by sysfs PCI identity, and advertises them to the Kubernetes scheduler as `nvidia.com/gpu` and `nvidia.com/nvswitch-fabric`. The [Service VM](#service-vm) section says what the fabric is on each platform and when it is advertised. It never binds, configures, or reconfigures any device. VFIO binding and all other infrastructure operations happen on the trusted side, outside the workload cluster.
 
 A clash with another plugin advertising `nvidia.com/gpu` is intentional and detects misconfiguration: trusted and untrusted workloads do not share a cluster, so on a Kata/untrusted cluster nothing else exposes this resource.
 
-The plugin talks only to the kubelet, over unix sockets. It has no Kubernetes API access, no RBAC, and no modes — behaviour is identical on every platform.
+The plugin talks to the kubelet over unix sockets and hosts one more endpoint, the fabric view service described below, which only the node's Service VM can feed. It has no Kubernetes API access and no RBAC. Behaviour is identical on every platform; what differs per node is what the fabric owner publishes.
 
 ## Supported platforms
 
 **HGX H100, HGX B200/B300, GB200 NVL72, GB300, Vera Rubin.**
 
 GPUs (and NVSwitches, where the platform has them) are passed through to Kata VMs via VFIO. The plugin enumerates IOMMUFD cdevs under `/dev/vfio/devices/`, classifies each via `/sys/class/vfio-dev/vfioN/device` PCI vendor/class, and advertises each as one device of the matching resource.
+
+## Service VM
+
+NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests `nvidia.com/nvswitch-fabric: 1`, the same on every platform. On HGX H100/H200 that one device holds the four NVSwitch chips. On HGX B200/B300 it holds the management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together; telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads, and the plugin stays a sysfs reader and binds nothing. The fabric is advertised only once every switch function on the node is bound, so a Service VM never starts with part of one. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image and one pod spec serve both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
+
+## Fabric partitions
+
+In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partitions, and a tenant VM must receive exactly one active partition's GPUs: GPUs that share an active partition reach each other over NVLink, so this is isolation, not convenience. The plugin has to advertise the partitions, and it cannot read Fabric Manager, by design.
+
+**The view.** The Fabric Manager client in the Service VM publishes the partition lists to the plugin's view service in one gRPC call, and the plugin keeps that view, on disk next to its token so a plugin restart keeps the node's capacity, until the next call or until the fabric changes hands. Only the fabric holder may publish: the fabric's Allocate injects an endpoint and a freshly minted token into that container's environment, the listener admits only that token, and a new holder's Allocate withdraws the view, since the partitions it described were the previous holder's. The plugin is a scheduling ledger and Fabric Manager is the enforcement point: a stale view sends a pod to GPUs whose fabric is not ready, where CUDA init fails, and cannot hand out another partition's GPUs. So the command that changes partitions publishes the result and exits; nothing stays connected. The schema is the `kata-fabric-api` crate in this repository.
+
+## Who may hold the fabric
+
+The fabric holder decides which GPUs share NVLink and publishes the view the node advertises. A tenant holding it can put its own GPUs and other tenants' into one partition, a cross-tenant data path, not a denial of service. The plugin cannot refuse a requester: the kubelet's Allocate names devices, not pods, and the plugin has no API access. A capacity of one is no protection either; a pending request wins the race when the Service VM restarts.
+
+The gate is admission. The chart ships a `ValidatingAdmissionPolicy` that denies `nvidia.com/nvswitch-fabric` in any pod outside the namespaces in `fabricOwnerNamespaces` (Kubernetes 1.30 or later). Tenants hold no verbs in the owner namespaces, so `kubectl exec` into the Service VM stays the owner's. When a node is dedicated to one tenant who runs their own Service VM, the owner namespace is that tenant's; the gate is the same.
 
 ## Out of scope: multi-node NVLink (IMEX)
 
@@ -48,6 +64,8 @@ Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consump
 
 The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
 
+The unit of advertisement is the smallest thing a consumer can take. For GPUs that is the PCI device: a multi-function device is one device whose CDI entry carries every function, because no consumer can take a function without its siblings. The NVSwitch fabric goes one step further and is one device per node, spanning the four switch chips on H100/H200 or the management ConnectX's PFs on B200/B300, because it has exactly one consumer, the Service VM, and exactly one valid shape, all of it. A subset of a fabric is never a consumption choice the layer above could make, which is what separates it from GPUs, whose shapes are many; grouping devices that have more than one valid consumption shape stays out.
+
 ### Why the plugin does not bind VFIO devices
 
 Binding a device is a reconfiguration of the infrastructure. The workload cluster is read-only toward the infrastructure; reconfiguration authority lives in the admin cluster. Placing a component that can bind devices inside the workload cluster would put infrastructure control next to the untrusted workloads it is meant to contain (boundary document, ADR 1000). The device plugin only declares what already exists.
@@ -58,7 +76,7 @@ The isolation primitive for untrusted workloads is the VM or CVM boundary, not p
 
 ## Cluster shape
 
-This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices and configure the NVLink fabric.
+This plugin runs in the **workload cluster**, which is read-only toward the infrastructure. It never runs in the admin cluster. The admin cluster holds the components that bind VFIO devices. NVLink fabric configuration runs in the Service VM, a Kata pod in the workload cluster that holds the node's `nvidia.com/nvswitch-fabric` device.
 
 ```text
 Admin cluster                        Workload cluster
@@ -66,4 +84,5 @@ Admin cluster                        Workload cluster
 GPU Operator (driver, MIG, fabric)   kata-device-plugin (declares only)
 VFIO binder                          Kata VMs
                                      Workload pods requesting nvidia.com/gpu
+                                     Service VM pod requesting nvidia.com/nvswitch-fabric
 ```

@@ -2,247 +2,28 @@
 /// cluster required.  The mock registration service probes the plugin's
 /// endpoint before acknowledging, exactly like kubelet's device manager — so
 /// ordering bugs (register before serve) fail here instead of on a node.
-use std::path::PathBuf;
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use kata_device_plugin::dp::v1beta1::{
-    device_plugin_client::DevicePluginClient,
-    registration_server::{Registration, RegistrationServer},
-    AllocateRequest, ContainerAllocateRequest, Empty, ListAndWatchResponse,
-    PreStartContainerRequest, PreferredAllocationRequest, RegisterRequest,
+    registration_server::RegistrationServer, AllocateRequest, ContainerAllocateRequest, Empty,
+    PreStartContainerRequest, PreferredAllocationRequest,
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use pcilibs_rs::testfs::add as add_dev;
+use pcilibs_rs::testfs::{add as add_dev, add_at};
 use pcilibs_rs::Sysfs;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint, Server, Uri};
-use tonic::{Request, Response, Status, Streaming};
-use tower::service_fn;
+use tonic::transport::Server;
+use tonic::Request;
 
-// ── mock kubelet ──────────────────────────────────────────────────────────────
-
-struct MockKubelet {
-    socket_dir: PathBuf,
-    registered: Arc<Mutex<Option<RegisterRequest>>>,
-}
-
-#[tonic::async_trait]
-impl Registration for MockKubelet {
-    async fn register(&self, req: Request<RegisterRequest>) -> Result<Response<Empty>, Status> {
-        let req = req.into_inner();
-        // The real kubelet dials the endpoint and probes it inside Register —
-        // a plugin that registers before serving deadlocks right here.
-        let sock = self.socket_dir.join(&req.endpoint);
-        let probe = async {
-            let mut client = unix_client(sock).await;
-            client
-                .get_device_plugin_options(Request::new(Empty {}))
-                .await
-        };
-        tokio::time::timeout(Duration::from_secs(2), probe)
-            .await
-            .map_err(|_| Status::deadline_exceeded("failed to dial device plugin"))?
-            .map_err(|e| Status::unknown(format!("endpoint probe failed: {e}")))?;
-        *self.registered.lock().unwrap() = Some(req);
-        Ok(Response::new(Empty {}))
-    }
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// n GPU cdevs (vfio0..vfio(n-1)); n = 0 gives an empty devices dir.
-fn fake_vfio(n: u32) -> TempDir {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir(dir.path().join("devices")).unwrap();
-    for i in 0..n {
-        add_dev(dir.path(), i, "0x10de", "0x2330", "0x030200");
-    }
-    dir
-}
-
-async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<Channel> {
-    let channel = Endpoint::try_from("http://[::]:0")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket_path = socket_path.clone();
-            async move {
-                // tonic 0.12 speaks hyper 1.0 IO traits, not tokio's.
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
-                    tokio::net::UnixStream::connect(socket_path).await?,
-                ))
-            }
-        }))
-        .await
-        .unwrap();
-    DevicePluginClient::new(channel)
-}
-
-/// Mock kubelet plus one running DeviceServer per resource name.
-struct Node {
-    // Keeps the fake /dev/vfio alive for the servers' lifetime.
-    _vfio: TempDir,
-    sockets: TempDir,
-    cdi: TempDir,
-    registered: Arc<Mutex<Option<RegisterRequest>>>,
-    token: CancellationToken,
-    servers: Vec<tokio::task::JoinHandle<()>>,
-    kubelet: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Node {
-    async fn start(vfio: TempDir, resources: &[&str]) -> Node {
-        Self::start_with(vfio, resources, Naming::Alias).await
-    }
-
-    async fn start_with(vfio: TempDir, resources: &[&str], naming: Naming) -> Node {
-        let sockets = TempDir::new().unwrap();
-        let cdi = TempDir::new().unwrap();
-        let registered = Arc::new(Mutex::new(None));
-
-        let listener = UnixListener::bind(sockets.path().join("kubelet.sock")).unwrap();
-        let mock = MockKubelet {
-            socket_dir: sockets.path().to_path_buf(),
-            registered: registered.clone(),
-        };
-        let kubelet = tokio::spawn(async move {
-            Server::builder()
-                .add_service(RegistrationServer::new(mock))
-                .serve_with_incoming(UnixListenerStream::new(listener))
-                .await
-                .ok();
-        });
-
-        let token = CancellationToken::new();
-        let servers = resources
-            .iter()
-            .map(|name| {
-                let server = DeviceServer::new(
-                    name,
-                    naming,
-                    vfio.path().to_str().unwrap(),
-                    vfio.path().to_str().unwrap(),
-                    sockets.path().to_str().unwrap(),
-                    cdi.path().to_str().unwrap(),
-                );
-                let tok = token.clone();
-                tokio::spawn(async move {
-                    server.run(tok).await.ok();
-                })
-            })
-            .collect();
-        // Let registration and the kubelet dial-back settle.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        Node {
-            _vfio: vfio,
-            sockets,
-            cdi,
-            registered,
-            token,
-            servers,
-            kubelet: Some(kubelet),
-        }
-    }
-
-    async fn stop_kubelet(&mut self, remove_plugin_socket: bool) -> anyhow::Result<()> {
-        if let Some(task) = self.kubelet.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        std::fs::remove_file(self.sockets.path().join("kubelet.sock"))?;
-        if remove_plugin_socket {
-            std::fs::remove_file(self.sockets.path().join("kata-gpu.sock"))?;
-        }
-        *self.registered.lock().map_err(|e| anyhow::anyhow!("{e}"))? = None;
-        Ok(())
-    }
-
-    fn start_kubelet(&mut self) -> anyhow::Result<()> {
-        let listener = UnixListener::bind(self.sockets.path().join("kubelet.sock"))?;
-        let mock = MockKubelet {
-            socket_dir: self.sockets.path().to_path_buf(),
-            registered: self.registered.clone(),
-        };
-        self.kubelet = Some(tokio::spawn(async move {
-            Server::builder()
-                .add_service(RegistrationServer::new(mock))
-                .serve_with_incoming(UnixListenerStream::new(listener))
-                .await
-                .ok();
-        }));
-        Ok(())
-    }
-
-    async fn wait_for_registration(&self) -> anyhow::Result<RegisterRequest> {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let registration = self
-                    .registered
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .clone();
-                if let Some(registration) = registration {
-                    return Ok(registration);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .context("plugin did not register with restarted kubelet")?
-    }
-
-    async fn client(&self, sock: &str) -> DevicePluginClient<Channel> {
-        unix_client(self.sockets.path().join(sock)).await
-    }
-
-    /// First ListAndWatch message plus the still-open stream.
-    async fn snapshot(
-        &self,
-        sock: &str,
-    ) -> (Streaming<ListAndWatchResponse>, ListAndWatchResponse) {
-        let mut stream = self
-            .client(sock)
-            .await
-            .list_and_watch(Request::new(Empty {}))
-            .await
-            .unwrap()
-            .into_inner();
-        let resp = tokio::time::timeout(Duration::from_secs(2), stream.message())
-            .await
-            .expect("ListAndWatch timeout")
-            .unwrap()
-            .expect("stream closed");
-        (stream, resp)
-    }
-
-    fn spec(&self, file: &str) -> Option<String> {
-        std::fs::read_to_string(self.cdi.path().join(file)).ok()
-    }
-
-    /// Cancel and require prompt exit: a graceful drain would hang forever on
-    /// the held-open ListAndWatch streams.
-    async fn shutdown(self) {
-        self.token.cancel();
-        for task in self.servers {
-            tokio::time::timeout(Duration::from_secs(2), task)
-                .await
-                .expect("server did not shut down after cancel")
-                .unwrap();
-        }
-        if let Some(task) = self.kubelet {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────────
+use common::*;
 
 #[tokio::test]
 async fn recovers_from_repeated_kubelet_restarts() -> anyhow::Result<()> {
@@ -255,13 +36,7 @@ async fn recovers_from_repeated_kubelet_restarts() -> anyhow::Result<()> {
         // Kubelet unlinks plugin endpoints on startup. Keep the old stream
         // open to ensure endpoint recreation does not wait for it to drain.
         node.stop_kubelet(true).await?;
-        add_dev(
-            node._vfio.path(),
-            restart + 2,
-            "0x10de",
-            "0x2330",
-            "0x030200",
-        );
+        add_dev(node._vfio.path(), restart + 2, 0x10de, 0x2330, 0x030200);
         if restart == 0 {
             tokio::time::sleep(Duration::from_secs(6)).await;
             assert!(node.sockets.path().join("kata-gpu.sock").exists());
@@ -352,11 +127,14 @@ async fn registers_with_kubelet_and_lists_devices() {
     let second = tokio::time::timeout(Duration::from_millis(300), stream.message()).await;
     assert!(second.is_err(), "ListAndWatch stream ended after snapshot");
 
-    // IDs are positions in the sorted enumeration — the same indices the CDI
-    // spec maps to cdev paths.
-    let mut ids: Vec<u32> = resp.devices.iter().map(|d| d.id.parse().unwrap()).collect();
+    // IDs are the devices' PCI slots, the names the CDI spec maps to cdev
+    // paths.
+    let mut ids: Vec<&str> = resp.devices.iter().map(|d| d.id.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, vec![0, 1, 2, 3]);
+    assert_eq!(
+        ids,
+        ["0000:00:00", "0000:01:00", "0000:02:00", "0000:03:00"]
+    );
     for d in &resp.devices {
         assert_eq!(d.health, "Healthy");
     }
@@ -382,7 +160,7 @@ async fn allocate_returns_cdi_device_names() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned(), "1".to_owned()],
+                devices_i_ds: vec!["0000:00:00".to_owned(), "0000:01:00".to_owned()],
             }],
         }))
         .await
@@ -395,7 +173,10 @@ async fn allocate_returns_cdi_device_names() {
         .iter()
         .map(|d| d.name.as_str())
         .collect();
-    assert_eq!(cdi_names, vec!["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
+    assert_eq!(
+        cdi_names,
+        vec!["nvidia.com/gpu=0000:00:00", "nvidia.com/gpu=0000:01:00"]
+    );
     // No DeviceSpec — device injection is the Kata shim's job, resolving CDI
     // names against the host spec, not the kubelet's via device paths.
     assert!(resp.container_responses[0].devices.is_empty());
@@ -408,7 +189,7 @@ async fn allocate_returns_cdi_device_names() {
 }
 
 #[tokio::test]
-async fn allocate_rejects_ids_beyond_present_devices() {
+async fn allocate_rejects_ids_of_absent_devices() {
     // The device set can shrink between scheduling and Allocate; a stale ID
     // must fail as a clear gRPC error, not as an unresolvable CDI name that
     // the Kata shim trips over later.
@@ -421,7 +202,7 @@ async fn allocate_rejects_ids_beyond_present_devices() {
         .await
         .allocate(Request::new(AllocateRequest {
             container_requests: vec![ContainerAllocateRequest {
-                devices_i_ds: vec!["0".to_owned(), "1".to_owned()],
+                devices_i_ds: vec!["0000:00:00".to_owned(), "0000:01:00".to_owned()],
             }],
         }))
         .await
@@ -456,7 +237,7 @@ async fn devices_appearing_after_startup_are_published() {
     assert_eq!(first.devices.len(), 0, "must start with zero devices");
 
     // Simulate the VFIO cdev appearing after the DP is already running.
-    add_dev(node._vfio.path(), 0, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 0, 0x10de, 0x2330, 0x030200);
 
     // The poller ticks every POLL_INTERVAL (5 s).  Time is paused
     // (start_paused), so the tick auto-advances as soon as the runtime idles;
@@ -483,10 +264,10 @@ fn remove_dev(root: &std::path::Path, n: u32) {
 
 #[tokio::test(start_paused = true)]
 async fn same_count_device_swap_refreshes_cdi_spec() {
-    // vfio0 is replaced by vfio5 between polls.  The advertised Device list
-    // is identical (one device, id "0"), but the CDI index → cdev mapping
-    // changed, so the poller must detect the swap, rewrite the spec, and
-    // push an update.
+    // The GPU at slot 0000:00:00 is rebound between polls and comes back as
+    // vfio5.  Its ID, the slot, does not change, so the kubelet's list reads
+    // the same; the cdev behind the ID did, so the poller must rewrite the
+    // spec and push an update.
     let node = Node::start(fake_vfio(1), &["nvidia.com/gpu"]).await;
 
     let (mut stream, first) = node.snapshot("kata-gpu.sock").await;
@@ -497,7 +278,14 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
         .contains("vfio0"));
 
     remove_dev(node._vfio.path(), 0);
-    add_dev(node._vfio.path(), 5, "0x10de", "0x2330", "0x030200");
+    add_at(
+        node._vfio.path(),
+        5,
+        "0000:00:00.0",
+        0x10de,
+        0x2330,
+        0x030200,
+    );
 
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
         .await
@@ -505,6 +293,7 @@ async fn same_count_device_swap_refreshes_cdi_spec() {
         .unwrap()
         .expect("stream closed");
     assert_eq!(updated.devices.len(), 1, "count unchanged by design");
+    assert_eq!(updated.devices[0].id, "0000:00:00", "the ID is the slot");
     let spec = node.spec("kata.nvidia.com-gpu.yaml").unwrap();
     assert!(spec.contains("vfio5"), "spec must point at the new cdev");
     assert!(!spec.contains("vfio0"), "spec must not keep the dead cdev");
@@ -572,7 +361,7 @@ async fn cdi_write_failure_is_retried_next_tick() {
     let spec_path = node.cdi.path().join("kata.nvidia.com-gpu.yaml");
     std::fs::remove_file(&spec_path).unwrap();
     std::fs::create_dir(&spec_path).unwrap();
-    add_dev(node._vfio.path(), 1, "0x10de", "0x2330", "0x030200");
+    add_dev(node._vfio.path(), 1, 0x10de, 0x2330, 0x030200);
 
     // The device update must reach the kubelet even while the CDI write fails.
     let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
@@ -731,28 +520,29 @@ async fn grpc_stubs_respond() {
 }
 
 #[tokio::test]
-async fn gpu_and_nvswitch_filtered_by_pci_class() {
-    // A mixed node: 2 GPUs, 3 NVSwitches, and a VFIO-bound NIC that matches
-    // no RESOURCES row and must not be advertised anywhere.
+async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
+    // A mixed node: 2 GPUs, 3 NVSwitch chips forming one fabric, and a
+    // VFIO-bound NIC that matches no RESOURCES row and must not be
+    // advertised anywhere.
     let vfio = TempDir::new().unwrap();
     for i in 0..2 {
-        add_dev(vfio.path(), i, "0x10de", "0x2330", "0x030200");
+        add_dev(vfio.path(), i, 0x10de, 0x2330, 0x030200);
     }
     for i in 2..5 {
-        add_dev(vfio.path(), i, "0x10de", "0x22a3", "0x068000");
+        add_dev(vfio.path(), i, 0x10de, 0x22a3, 0x068000);
     }
-    add_dev(vfio.path(), 5, "0x15b3", "0x101e", "0x020000");
+    add_dev(vfio.path(), 5, 0x15b3, 0x101e, 0x020000);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch"]).await;
+    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
 
-    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch.sock", 3)] {
+    for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch-fabric.sock", 1)] {
         let (_stream, resp) = node.snapshot(sock).await;
         assert_eq!(resp.devices.len(), expected, "{sock}");
     }
 
     // Each resource's CDI spec holds only its own devices.
     let gpu = node.spec("kata.nvidia.com-gpu.yaml").unwrap();
-    let sw = node.spec("kata.nvidia.com-nvswitch.yaml").unwrap();
+    let sw = node.spec("kata.nvidia.com-nvswitch-fabric.yaml").unwrap();
     assert!(gpu.contains("devices/vfio0") && gpu.contains("devices/vfio1"));
     assert!(sw.contains("devices/vfio2") && sw.contains("devices/vfio4"));
     assert!(!gpu.contains("devices/vfio2") && !sw.contains("devices/vfio0"));
