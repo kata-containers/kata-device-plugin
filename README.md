@@ -16,6 +16,7 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
 | `nvidia.com/nvswitch-fabric` | `0x10de`, class `0x0680xx` (bridge: other), the NVSwitch chips |
 | `nvidia.com/nvswitch-fabric` | `0x15b3`, class `0x0207xx` (InfiniBand controller), NVSwitch management PFs only |
+| `nvidia.com/nvlink-{k}gpu` | derived from the GPU rows: one device per active Fabric Manager partition of k GPUs, when the Service VM has published its view |
 
 On HGX H100/H200 the NVSwitches are PCI bridge functions. On HGX B200/B300
 they are represented by the PFs of a management ConnectX ([HGX Shared
@@ -43,7 +44,10 @@ other code changes.
 The plugin declares supply only. How devices are consumed, as a whole tray
 (`nvidia.com/gpu: 4` on a GB200 compute tray) or as a subset, is a scheduling
 decision expressed in pod specs, node labels, and taints; the plugin never
-aggregates or partitions what the node declares.
+aggregates or partitions what the node declares. The NVSwitch fabric and the
+NVLink partitions are not aggregates of the plugin's making: each is a device
+the hardware or the fabric owner defines, with one valid shape
+([ARCHITECTURE.md](ARCHITECTURE.md#fabric-partitions)).
 
 For each present resource the plugin:
 

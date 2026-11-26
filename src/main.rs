@@ -131,10 +131,12 @@ async fn main() -> anyhow::Result<()> {
     // are never stopped — a name whose devices vanish keeps advertising
     // zero capacity via its own ListAndWatch poller.
     loop {
+        let current = view.as_ref().and_then(|view| view.current());
         let mut desired: Vec<String> = vfio::discover(
             Path::new(vfio::VFIO_DIR),
             &vfio::Sysfs::new(Path::new(vfio::SYSFS_ROOT)),
             naming,
+            current.as_ref(),
         )
         .into_keys()
         .collect();

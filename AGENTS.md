@@ -5,7 +5,7 @@ Read [CLAUDE.md](CLAUDE.md) first. This file adds agent-specific constraints on 
 ## Language and style
 
 - **Rust only.** Never suggest Go, Python, or shell scripts for production code.
-- Follow the existing file structure: `main.rs` owns the watcher loop and CLI; `plugin.rs` owns the device plugin gRPC server; `vfio.rs` owns enumeration and PCI classification; `view.rs` owns the fabric view service and its token.
+- Follow the existing file structure: `main.rs` owns the watcher loop and CLI; `plugin.rs` owns the device plugin gRPC server; `vfio.rs` owns enumeration and PCI classification; `view.rs` owns the fabric view service and its token; `partition.rs` turns the view into devices.
 - KISS. Prefer a `match` over a registry, a concrete struct over a trait object, a flat module over a nested one.
 - No comments that restate what the code says. Only comment the WHY when it is non-obvious (hardware constraint, security invariant, ADR reference).
 
@@ -24,7 +24,7 @@ Read [CLAUDE.md](CLAUDE.md) first. This file adds agent-specific constraints on 
 
 ## Testing
 
-Unit tests live next to the code (`vfio.rs`, `cdi.rs`, `view.rs`); integration tests in `tests/server.rs` and `tests/fabric.rs`, with their fixtures in `tests/common`, drive the gRPC server against a mock kubelet on unix sockets. Prefer integration tests that drive the gRPC server over unit tests that mock tonic internals.
+Unit tests live next to the code (`vfio.rs`, `cdi.rs`, `view.rs`); integration tests in `tests/server.rs`, `tests/fabric.rs` and `tests/partition.rs`, with their fixtures in `tests/common`, drive the gRPC server against a mock kubelet on unix sockets. Prefer integration tests that drive the gRPC server over unit tests that mock tonic internals.
 
 ## Do not
 

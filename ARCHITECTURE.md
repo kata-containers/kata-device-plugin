@@ -12,7 +12,7 @@ The plugin talks to the kubelet over unix sockets and hosts one more endpoint, t
 
 **HGX H100, HGX B200/B300, GB200 NVL72, GB300, Vera Rubin.**
 
-GPUs (and NVSwitches, where the platform has them) are passed through to Kata VMs via VFIO. The plugin enumerates IOMMUFD cdevs under `/dev/vfio/devices/`, classifies each via `/sys/class/vfio-dev/vfioN/device` PCI vendor/class, and advertises each as one device of the matching resource.
+GPUs (and NVSwitches, where the platform has them) are passed through to Kata VMs via VFIO. The plugin enumerates IOMMUFD cdevs under `/dev/vfio/devices/`, classifies each via `/sys/class/vfio-dev/vfioN/device` PCI vendor/class, and advertises each as one device of the matching resource; the NVSwitch fabric is one device per node, and under a published partition view GPUs are one device per active partition (see [Fabric partitions](#fabric-partitions)).
 
 ## Service VM
 
@@ -20,9 +20,22 @@ NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per n
 
 ## Fabric partitions
 
-In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partitions, and a tenant VM must receive exactly one active partition's GPUs: GPUs that share an active partition reach each other over NVLink, so this is isolation, not convenience. The plugin has to advertise the partitions, and it cannot read Fabric Manager, by design.
+In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partitions, and a tenant VM must receive exactly one active partition's GPUs: GPUs that share an active partition reach each other over NVLink, so this is isolation, not convenience. The plugin has to advertise the partitions, and it cannot read Fabric Manager, by design. Fabric Manager names a GPU by its physical ID, the module slot on the baseboard, never by PCI address; the host names it by PCI address. The plugin bridges the two through the firmware's slot label on the PCI function (`/sys/bus/pci/devices/<bdf>/label`, "GPU0, SMX7" on DGX systems); a GPU without a parsable label resolves to no partition, so an unknown board advertises nothing rather than a wrong partition. The resolution lives in pcilibs-rs (`fabric`).
 
 **The view.** The Fabric Manager client in the Service VM publishes the partition lists to the plugin's view service in one gRPC call, and the plugin keeps that view, on disk next to its token so a plugin restart keeps the node's capacity, until the next call or until the fabric changes hands. Only the fabric holder may publish: the fabric's Allocate injects an endpoint and a freshly minted token into that container's environment, the listener admits only that token, and a new holder's Allocate withdraws the view, since the partitions it described were the previous holder's. The plugin is a scheduling ledger and Fabric Manager is the enforcement point: a stale view sends a pod to GPUs whose fabric is not ready, where CUDA init fails, and cannot hand out another partition's GPUs. So the command that changes partitions publishes the result and exits; nothing stays connected. The schema is the `kata-fabric-api` crate in this repository.
+
+**The unit.** An active partition is advertised as its own extended resource named by size, `nvidia.com/nvlink-4gpu`, one device holding every function of every member GPU, identified by Fabric Manager's partition id (`p4`). A count under `nvidia.com/gpu` was rejected for partitions because it is ambiguous, four NVLinked GPUs read the same as four standalone ones, and only a per-shape ledger lets the scheduler see how many partitions remain. This is not the aggregate the plugin refuses to invent below: the fabric owner defines the partition in the Service VM and it has exactly one valid consumption shape. A single-GPU partition is a plain `nvidia.com/gpu`. An active partition is advertised Healthy only when supported by Fabric Manager, exclusive (no other active partition names one of its GPUs) and complete (every member bound and labeled on this host). Otherwise it is advertised Unhealthy, under the name of the size Fabric Manager gave it: the kubelet counts it in capacity and not in allocatable, so the partition the Service VM activated stays visible on the node while nothing can be scheduled on it, and the plugin logs the reason. An active partition with no member bound here is not advertised.
+
+**What the node advertises.**
+
+| node | view | unit | GPUs |
+| --- | --- | --- | --- |
+| fabric not VFIO-bound (host Fabric Manager, or no fabric) | none | | one device each, as before |
+| fabric VFIO-bound (a Service VM owns it) | none | | none, until the Service VM publishes |
+| any | present | `partition` or unset | one device per active partition, Unhealthy unless supported, exclusive and complete |
+| any | present | `gpu` | one device each: the owner holds the whole node and says so |
+
+A view takes precedence over the fabric's binding. The unit word travels in the view, so the owner of the fabric, the infrastructure or a tenant with a dedicated node, chooses it in their own Service VM pod spec.
 
 ## Who may hold the fabric
 

@@ -21,7 +21,7 @@ test-unit:
 # Integration tests: mock kubelet socket + fake VFIO devices.
 # No GPU or Kubernetes cluster required.
 test-integration:
-	cargo test --test server --test fabric
+	cargo test --test server --test fabric --test partition
 
 # All tests.
 test: test-unit test-integration

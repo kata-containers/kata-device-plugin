@@ -17,7 +17,7 @@ use std::sync::Arc;
 use kata_fabric_api::{ENDPOINT_ENV, TOKEN_ENV};
 
 use crate::cdi;
-use crate::vfio::{self, Naming, Sysfs};
+use crate::vfio::{self, Health, Naming, Sysfs};
 use crate::view::View;
 
 use crate::dp::v1beta1::{
@@ -132,7 +132,8 @@ impl DeviceServer {
     /// This server's devices under the current scan: the discover() group
     /// matching our resolved name.
     fn my_devices(&self) -> Vec<vfio::Entry> {
-        vfio::discover(&self.device_dir, &self.sysfs, self.naming)
+        let view = self.view.as_ref().and_then(|view| view.current());
+        vfio::discover(&self.device_dir, &self.sysfs, self.naming, view.as_ref())
             .remove(&self.name)
             .unwrap_or_default()
     }
@@ -261,6 +262,15 @@ impl DeviceServer {
     }
 }
 
+/// The devices the kubelet may hand out: the Healthy ones.
+fn allocatable(entries: &[vfio::Entry]) -> Vec<vfio::Entry> {
+    entries
+        .iter()
+        .filter(|entry| entry.health == Health::Healthy)
+        .cloned()
+        .collect()
+}
+
 // Include ctime so rapid unlink/rebind cycles cannot hide inode reuse.
 async fn socket_identity(path: &Path) -> anyhow::Result<Option<(u64, u64, i64, i64)>> {
     match tokio::fs::metadata(path).await {
@@ -325,7 +335,7 @@ impl DevicePlugin for DeviceServer {
             // must retry next tick without re-sending an identical device
             // list every 5s (kubelet churn); a device change must reach the
             // kubelet even while the CDI registry is briefly unwritable.
-            let mut sent: Option<Vec<(String, Vec<u32>)>> = None;
+            let mut sent: Option<Vec<(String, Vec<u32>, Health)>> = None;
             let mut synced: Option<Vec<(String, Vec<u32>)>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
@@ -337,20 +347,28 @@ impl DevicePlugin for DeviceServer {
 
                 let entries = server.my_devices();
                 // The key is every device's ID with the cdev numbers behind
-                // it: an ID names a slot and stays while the functions under
-                // it change (vfio7 gone, vfio9 new), and the CDI spec must
-                // follow those.
-                let key: Vec<(String, Vec<u32>)> = entries
+                // it and its health: an ID names a slot or a partition and
+                // stays while the functions under it change (vfio7 gone,
+                // vfio9 new), and the CDI spec must follow those; a
+                // partition Fabric Manager stops supporting keeps its cdevs.
+                let key: Vec<(String, Vec<u32>, Health)> = entries
                     .iter()
                     .map(|entry| {
                         let nums = entry.device.iter().map(|cdev| cdev.num).collect();
-                        (entry.id.clone(), nums)
+                        (entry.id.clone(), nums, entry.health)
                     })
                     .collect();
 
-                if Some(&key) != synced.as_ref() {
-                    match server.sync_cdi_spec(&entries).await {
-                        Ok(()) => synced = Some(key.clone()),
+                // Only allocatable devices get CDI names.
+                let allocatable = allocatable(&entries);
+                let allocatable_key: Vec<(String, Vec<u32>)> = key
+                    .iter()
+                    .filter(|(_, _, health)| *health == Health::Healthy)
+                    .map(|(id, nums, _)| (id.clone(), nums.clone()))
+                    .collect();
+                if Some(&allocatable_key) != synced.as_ref() {
+                    match server.sync_cdi_spec(&allocatable).await {
+                        Ok(()) => synced = Some(allocatable_key),
                         Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
                     }
                 }
@@ -358,6 +376,7 @@ impl DevicePlugin for DeviceServer {
                 if Some(&key) != sent.as_ref() {
                     info!(
                         count = key.len(),
+                        unhealthy = key.len() - allocatable.len(),
                         resource = %server.name,
                         "device list changed"
                     );
@@ -365,7 +384,7 @@ impl DevicePlugin for DeviceServer {
                         .iter()
                         .map(|entry| Device {
                             id: entry.id.clone(),
-                            health: "Healthy".to_owned(),
+                            health: entry.health.as_str().to_owned(),
                             topology: None,
                         })
                         .collect();
@@ -409,7 +428,7 @@ impl DevicePlugin for DeviceServer {
         // The device set can shrink between scheduling and Allocate.  Check
         // the requested IDs against a fresh enumeration so a stale ID fails
         // loudly here instead of as an unresolvable CDI name in the shim.
-        let entries = self.my_devices();
+        let entries = allocatable(&self.my_devices());
         // The names below only work if the shim can resolve them at
         // SandboxCreate.  Sync the spec from the very enumeration we validate
         // against; if the CDI registry can't be written, fail the RPC now
@@ -428,8 +447,8 @@ impl DevicePlugin for DeviceServer {
             for id in cr.devices_i_ds {
                 if !entries.iter().any(|entry| entry.id == id) {
                     return Err(Status::not_found(format!(
-                        "device {id} of {resource_name} is no longer present \
-                         ({} devices bound)",
+                        "device {id} of {resource_name} is not allocatable \
+                         ({} healthy devices bound)",
                         entries.len()
                     )));
                 }

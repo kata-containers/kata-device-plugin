@@ -471,11 +471,15 @@ async fn sku_mode_serves_under_the_sku_name() {
     // End to end under a SKU-resolved name: socket, registration, CDI spec
     // file, and device IDs must all follow the resolved name, not the row.
     let vfio = fake_vfio(2);
-    let name =
-        kata_device_plugin::vfio::discover(vfio.path(), &Sysfs::new(vfio.path()), Naming::Sku)
-            .into_keys()
-            .next()
-            .expect("two H100 cdevs resolve to one SKU name");
+    let name = kata_device_plugin::vfio::discover(
+        vfio.path(),
+        &Sysfs::new(vfio.path()),
+        Naming::Sku,
+        None,
+    )
+    .into_keys()
+    .next()
+    .expect("two H100 cdevs resolve to one SKU name");
     assert!(name.starts_with("nvidia.com/GH100"), "{name}");
 
     let sock = format!("kata-{}.sock", name.rsplit('/').next().unwrap());
@@ -533,7 +537,16 @@ async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
     }
     add_dev(vfio.path(), 5, 0x15b3, 0x101e, 0x020000);
 
-    let node = Node::start(vfio, &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"]).await;
+    // The fabric is bound, so GPUs appear only once the owner's view says
+    // how; unit gpu keeps them one device each.
+    let owner = published(fabric_view("gpu", &[])).await;
+    let node = Node::start_with_view(
+        vfio,
+        &["nvidia.com/gpu", "nvidia.com/nvswitch-fabric"],
+        Naming::Alias,
+        Some(owner.view.clone()),
+    )
+    .await;
 
     for (sock, expected) in [("kata-gpu.sock", 2), ("kata-nvswitch-fabric.sock", 1)] {
         let (_stream, resp) = node.snapshot(sock).await;
@@ -550,4 +563,5 @@ async fn gpu_and_nvswitch_fabric_filtered_by_pci_class() {
     assert!(!gpu.contains("devices/vfio5") && !sw.contains("devices/vfio5"));
 
     node.shutdown().await;
+    owner.stop.cancel();
 }

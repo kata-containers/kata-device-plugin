@@ -2,6 +2,9 @@ use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::partition;
+
+use kata_fabric_api::v1::FabricView;
 use pcilibs_rs::platform::Topology;
 pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as SYSFS_ROOT};
 
@@ -14,14 +17,16 @@ pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as S
 pub type Device = Vec<IommufdDev>;
 
 /// One advertised device: the ID the kubelet, the CDI spec and Allocate
-/// share, and the cdevs behind it.  The ID is a fact about the device, the
-/// lowest PCI slot among its functions, so a change elsewhere in the list
-/// never renames a device a pod already holds, the way an index would, and
-/// a rebind that renumbers the cdevs does not move it either.
+/// share, the cdevs behind it, and whether it may be handed out.  The ID is
+/// a fact about the device, so a change elsewhere in the list never renames
+/// a device a pod already holds, the way an index would: the lowest PCI slot
+/// among its functions, which a rebind that renumbers the cdevs does not
+/// move either, or `p<id>` for a Fabric Manager partition.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub id: String,
     pub device: Device,
+    pub health: Health,
 }
 
 impl Entry {
@@ -32,14 +37,41 @@ impl Entry {
             .min()
             .expect("a device has at least one function")
             .to_owned();
-        Self { id, device }
+        Self {
+            id,
+            device,
+            health: Health::Healthy,
+        }
+    }
+}
+
+/// Whether the kubelet may hand a device out.  An Unhealthy device counts
+/// in the node's capacity and not in its allocatable, so what the Service
+/// VM activated stays visible on the node while nothing can be scheduled on
+/// it; it gets no CDI name, since it is never handed out and its member
+/// list may be partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    Healthy,
+    Unhealthy,
+}
+
+impl Health {
+    /// The device plugin API's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Unhealthy => "Unhealthy",
+        }
     }
 }
 
 /// How a row's bound functions become advertised devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
-    /// One device per PCI device, holding every bound function of it.
+    /// One device per PCI device, holding every bound function of it.  These
+    /// rows are the GPUs, which a published partition view regroups; see
+    /// [`crate::partition`].
     PciDevice,
     /// One device per node, holding every bound function of every row with
     /// the name, and only once all of them are bound.  For a resource whose
@@ -121,6 +153,10 @@ impl Resource {
     }
 }
 
+/// The domain of every row's name, and of the partition resources derived
+/// from the GPU rows (`nvidia.com/nvlink-4gpu`).
+pub const DOMAIN: &str = "nvidia.com";
+
 /// Everything this plugin can advertise, first match wins — put curated
 /// alias rows (exact device id) above their class fallback.  Rows may share
 /// a name when one resource has more than one PCI face; their devices are
@@ -165,7 +201,20 @@ pub const RESOURCES: &[Resource] = &[
 /// grouping: PCI-device rows order their devices by PCI address, which
 /// survives a reboot where cdev numbers do not, and a fabric is one device,
 /// advertised whole or not at all.  Each device is named by its lowest slot.
-pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Entry>> {
+///
+/// `view` is the fabric partition view the Service VM's Fabric Manager
+/// client published, if one exists.  It decides how GPUs are advertised,
+/// because in shared NVSwitch mode GPUs that share an active partition reach
+/// each other over NVLink and a tenant must get exactly one partition: with
+/// a view, [`partition::units`]; without one, GPUs are advertised one by
+/// one unless the node's fabric is VFIO-bound, which means a Service VM owns
+/// it and its view is not there yet, so no GPU is advertised until it is.
+pub fn discover(
+    vfio_dir: &Path,
+    sysfs: &Sysfs,
+    naming: Naming,
+    view: Option<&FabricView>,
+) -> BTreeMap<String, Vec<Entry>> {
     // Name, then PCI slot, then the slot's bound functions.  No row has a
     // multi-function PCI device today; the slot is the principle
     // ARCHITECTURE.md states, functions are never separate devices, and the
@@ -230,16 +279,36 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
         }
         missing.is_empty()
     });
-    pci.into_iter()
-        .map(|(name, devices)| {
-            let entries = devices.into_values().map(Entry::by_slot).collect();
-            (name, entries)
-        })
+    // GPUs follow the view; the fabric is advertised as scanned.
+    let gpus = match view {
+        Some(view) => partition::units(view, sysfs, pci),
+        None if !fabrics.is_empty() => {
+            tracing::warn!(
+                "fabric is bound but no partition view is published: advertising no GPU"
+            );
+            BTreeMap::new()
+        }
+        None => by_slot(pci),
+    };
+    gpus.into_iter()
         .chain(
             fabrics
                 .into_iter()
                 .map(|(name, device)| (name, vec![Entry::by_slot(device)])),
         )
+        .collect()
+}
+
+/// One advertised device per PCI device, in PCI order: the unit when nothing
+/// says how GPUs relate to each other.
+pub(crate) fn by_slot(
+    pci: BTreeMap<String, BTreeMap<String, Device>>,
+) -> BTreeMap<String, Vec<Entry>> {
+    pci.into_iter()
+        .map(|(name, devices)| {
+            let entries = devices.into_values().map(Entry::by_slot).collect();
+            (name, entries)
+        })
         .collect()
 }
 
@@ -341,6 +410,14 @@ mod tests {
         entries.iter().map(|entry| entry.id.as_str()).collect()
     }
 
+    /// The owner's unit `gpu`: one device per GPU.
+    fn gpu_view() -> FabricView {
+        FabricView {
+            unit: "gpu".to_owned(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn alias_mode_classifies_and_sorts() {
         let root = TempDir::new().unwrap();
@@ -350,7 +427,19 @@ mod tests {
         // A VFIO-bound NIC must not be advertised under any resource.
         testfs::add(root.path(), 3, 0x15b3, 0x101e, 0x020000);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
+        // The switch chip is the node's fabric, bound: without a view the GPUs
+        // are withheld; with the owner's unit `gpu` they are one device each.
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None);
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["nvidia.com/nvswitch-fabric"]
+        );
+        let map = discover(
+            root.path(),
+            &Sysfs::new(root.path()),
+            Naming::Alias,
+            Some(&gpu_view()),
+        );
         assert_eq!(map.len(), 2);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![7], vec![42]]);
         assert!(map["nvidia.com/gpu"][0].device[0]
@@ -365,7 +454,7 @@ mod tests {
         testfs::add_gpu(root.path(), 0);
         testfs::add_gpu(root.path(), 1);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku, None);
         assert_eq!(map.len(), 1);
         let (name, devs) = map.iter().next().unwrap();
         // Loose on the marketing suffix: the database may reword it, but the
@@ -383,7 +472,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         testfs::add(root.path(), 0, 0x10de, 0xdead, 0x030200);
 
-        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku);
+        let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Sku, None);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("nvidia.com/gpu"));
     }
@@ -440,13 +529,17 @@ mod tests {
         testfs::add_gpu(r, 2);
         testfs::add_connectx_cdev(r, 6, "0000:18:00.0", false);
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
-        assert_eq!(map.len(), 2);
-        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![2]]);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["nvidia.com/nvswitch-fabric"]
+        );
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 3, 4, 5]]
         );
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, Some(&gpu_view()));
+        assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![2]]);
     }
 
     #[test]
@@ -459,7 +552,7 @@ mod tests {
             testfs::add_nvswitch(r, n);
         }
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 2, 3, 4]]
@@ -481,12 +574,12 @@ mod tests {
         }
         std::fs::remove_file(r.join("devices/vfio4")).unwrap();
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(map.len(), 1);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
 
         std::fs::write(r.join("devices/vfio4"), b"").unwrap();
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(
             nums(&map["nvidia.com/nvswitch-fabric"]),
             vec![vec![1, 2, 3, 4]]
@@ -501,7 +594,7 @@ mod tests {
         for function in 2..4u32 {
             std::fs::remove_file(r.join(format!("devices/vfio{function}"))).unwrap();
         }
-        assert!(discover(r, &Sysfs::new(r), Naming::Alias).is_empty());
+        assert!(discover(r, &Sysfs::new(r), Naming::Alias, None).is_empty());
     }
 
     #[test]
@@ -520,7 +613,7 @@ mod tests {
         std::fs::remove_file(&vpd).unwrap();
         std::fs::create_dir(vpd).unwrap();
 
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(map.len(), 1);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
     }
@@ -533,10 +626,10 @@ mod tests {
         let r = root.path();
         testfs::add_gpu(r, 42);
         testfs::add_gpu(r, 7);
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(ids(&map["nvidia.com/gpu"]), ["0000:07:00", "0000:2a:00"]);
         std::fs::remove_file(r.join("devices/vfio7")).unwrap();
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(ids(&map["nvidia.com/gpu"]), ["0000:2a:00"]);
 
         // H100: switch chips in several slots.  The cdev numbers follow the
@@ -546,7 +639,7 @@ mod tests {
             let r = root.path();
             pcilibs_rs::testfs::add_at(r, low, "0000:0c:00.0", 0x10de, 0x22a3, 0x068000);
             pcilibs_rs::testfs::add_at(r, high, "0000:03:00.0", 0x10de, 0x22a3, 0x068000);
-            let map = discover(r, &Sysfs::new(r), Naming::Alias);
+            let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
             assert_eq!(ids(&map["nvidia.com/nvswitch-fabric"]), ["0000:03:00"]);
         }
 
@@ -561,7 +654,7 @@ mod tests {
                 function < 2,
             );
         }
-        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias, None);
         assert_eq!(ids(&map["nvidia.com/nvswitch-fabric"]), ["0000:05:00"]);
     }
 
@@ -572,7 +665,7 @@ mod tests {
         let r = root.path();
         testfs::add_connectx_cdev(r, 0, "0000:05:00.0", true);
 
-        let map = discover(r, &Sysfs::new(r), Naming::Sku);
+        let map = discover(r, &Sysfs::new(r), Naming::Sku, None);
         assert_eq!(
             map.keys().collect::<Vec<_>>(),
             ["nvidia.com/nvswitch-fabric"]
@@ -587,14 +680,14 @@ mod tests {
         std::fs::write(devices.join("vfio0"), b"").unwrap();
 
         for naming in [Naming::Alias, Naming::Sku] {
-            assert!(discover(root.path(), &Sysfs::new(root.path()), naming).is_empty());
+            assert!(discover(root.path(), &Sysfs::new(root.path()), naming, None).is_empty());
         }
     }
 
     #[test]
     fn missing_devices_dir_is_empty() {
         let root = TempDir::new().unwrap();
-        assert!(discover(root.path(), &Sysfs::new(root.path()), Naming::Alias).is_empty());
+        assert!(discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None).is_empty());
     }
 
     #[test]
@@ -613,6 +706,15 @@ mod tests {
         assert_eq!(sanitize("GB100 [HGX GB200]"), "GB100_HGX_GB200");
         assert_eq!(sanitize("a/b.c  d"), "A_B_C_D");
         assert_eq!(sanitize("  trimmed  "), "TRIMMED");
+    }
+
+    #[test]
+    fn every_row_is_in_the_domain() {
+        // Partition resources are named under DOMAIN, so a row elsewhere
+        // would put a partition's GPUs under another domain than their own.
+        for row in RESOURCES {
+            assert!(row.name.starts_with(&format!("{DOMAIN}/")), "{}", row.name);
+        }
     }
 
     #[test]

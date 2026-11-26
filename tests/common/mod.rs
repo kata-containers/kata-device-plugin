@@ -1,5 +1,5 @@
-//! Fixtures shared by the integration tests: a mock kubelet and a node of
-//! DeviceServers over a fake /dev/vfio.
+//! Fixtures shared by the integration tests: a mock kubelet, a node of
+//! DeviceServers over a fake /dev/vfio, and a published fabric view.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -14,7 +14,10 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::Naming;
-use pcilibs_rs::testfs::add as add_dev;
+use kata_device_plugin::view::{self, View};
+use kata_fabric_api::grpc::{with_token, FabricViewServiceClient};
+use kata_fabric_api::v1::{self, FabricView};
+use pcilibs_rs::testfs::{add as add_dev, add_at};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -81,6 +84,86 @@ pub async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<Channel> {
     DevicePluginClient::new(channel)
 }
 
+/// A view and the service it was published through.
+pub struct Published {
+    pub view: Arc<View>,
+    pub stop: CancellationToken,
+    pub _state: TempDir,
+    port: u16,
+}
+
+impl Published {
+    /// One more Publish call, the way fmclient makes it after a change.
+    pub async fn publish(&self, fabric_view: FabricView) {
+        let channel = Endpoint::from_shared(format!("http://127.0.0.1:{}", self.port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        FabricViewServiceClient::new(channel)
+            .publish(with_token(Request::new(fabric_view), &self.view.token()).unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+/// Publish `fabric_view` the way fmclient does: one call, with the token.
+pub async fn published(fabric_view: FabricView) -> Published {
+    let state = TempDir::new().unwrap();
+    let view = View::load(state.path()).unwrap();
+    let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let stop = CancellationToken::new();
+    tokio::spawn(view::serve(view.clone(), tcp, stop.clone()));
+    let owner = Published {
+        view,
+        stop,
+        _state: state,
+        port,
+    };
+    owner.publish(fabric_view).await;
+    assert!(
+        owner.view.current().is_some(),
+        "the published view did not become current"
+    );
+    owner
+}
+
+/// A view: unit word and `(id, active, member physical ids)` partitions.
+pub fn fabric_view(unit: &str, partitions: &[(u32, bool, &[u32])]) -> FabricView {
+    FabricView {
+        partitions: Some(v1::PartitionList {
+            version: 1,
+            max_num_partitions: 15,
+            partition_info: partitions
+                .iter()
+                .map(|&(id, active, members)| v1::Partition {
+                    partition_id: id,
+                    is_active: active,
+                    gpu_info: members
+                        .iter()
+                        .map(|&physical_id| v1::PartitionGpu {
+                            physical_id,
+                            ..Default::default()
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }),
+        unsupported: None,
+        unit: unit.to_owned(),
+    }
+}
+
+/// A GPU as cdev `n` at `address`, labeled with module slot `module` the way
+/// DGX firmware does.
+pub fn add_labeled_gpu(root: &std::path::Path, n: u32, address: &str, module: u8) {
+    let function = add_at(root, n, address, 0x10de, 0x2330, 0x030200);
+    std::fs::write(function.join("label"), format!("GPU{n}, SMX{module}\n")).unwrap();
+}
+
 /// Mock kubelet plus one running DeviceServer per resource name.
 pub struct Node {
     // Keeps the fake /dev/vfio alive for the servers' lifetime.
@@ -99,6 +182,18 @@ impl Node {
     }
 
     pub async fn start_with(vfio: TempDir, resources: &[&str], naming: Naming) -> Node {
+        Self::start_with_view(vfio, resources, naming, None).await
+    }
+
+    /// With a view, the fabric's Allocate hands its holder the token and the
+    /// servers advertise GPUs as the view says; without one, a bound fabric
+    /// withholds them.
+    pub async fn start_with_view(
+        vfio: TempDir,
+        resources: &[&str],
+        naming: Naming,
+        view: Option<Arc<View>>,
+    ) -> Node {
         let sockets = TempDir::new().unwrap();
         let cdi = TempDir::new().unwrap();
         let registered = Arc::new(Mutex::new(None));
@@ -120,7 +215,7 @@ impl Node {
         let servers = resources
             .iter()
             .map(|name| {
-                let server = DeviceServer::new(
+                let mut server = DeviceServer::new(
                     name,
                     naming,
                     vfio.path().to_str().unwrap(),
@@ -128,6 +223,9 @@ impl Node {
                     sockets.path().to_str().unwrap(),
                     cdi.path().to_str().unwrap(),
                 );
+                if let Some(view) = &view {
+                    server = server.with_view(view.clone(), None);
+                }
                 let tok = token.clone();
                 tokio::spawn(async move {
                     server.run(tok).await.ok();

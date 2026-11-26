@@ -99,7 +99,7 @@ mod tests {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
-        vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
+        vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/gpu")
             .unwrap_or_default()
     }
@@ -186,7 +186,7 @@ mod tests {
         for n in [3u32, 4] {
             testfs::add_nvswitch(root.path(), n);
         }
-        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
+        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/nvswitch-fabric")
             .unwrap_or_default();
 
@@ -212,7 +212,7 @@ mod tests {
                 function < 2,
             );
         }
-        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias)
+        let devs = vfio::discover(root.path(), &Sysfs::new(root.path()), Naming::Alias, None)
             .remove("nvidia.com/nvswitch-fabric")
             .unwrap_or_default();
 

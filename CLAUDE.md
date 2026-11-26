@@ -13,6 +13,7 @@ src/
   main.rs      entry point: start one DeviceServer per present resource, wait for shutdown
   plugin.rs    DeviceServer (tonic gRPC impl) + socket/CDI-dir constants
   vfio.rs      IOMMUFD cdev enumeration + the RESOURCES table (PCI identity → resource name)
+  partition.rs active Fabric Manager partitions as devices, from the view
   view.rs      the fabric view service the Service VM's Fabric Manager client publishes to, and its token
   cdi.rs       host-side CDI spec writer (read by the Kata shim)
 proto/
@@ -36,6 +37,8 @@ deploy/
 The plugin advertises `nvidia.com/gpu` — the same name the standard NVIDIA device plugin would use.  This is intentional: trusted and untrusted workloads never share a cluster, so on a Kata/untrusted cluster nothing else exposes `nvidia.com/gpu`.  A clash means two device plugins are running on the same node, which is a misconfiguration that should be detected loudly.  The names live in the `RESOURCES` table in `src/vfio.rs`, not configuration.
 
 `nvidia.com/nvswitch-fabric` is the node's whole NVSwitch fabric as one device, every switch function with one CDI node each, which the Service VM running Fabric Manager requests as `nvidia.com/nvswitch-fabric: 1` on every platform. Fabric rows keep this alias in SKU mode, since one function's SKU would misname a fabric. ARCHITECTURE.md's Service VM section says what the fabric is on each platform and why it is one device.
+
+In shared NVSwitch mode the Service VM's Fabric Manager client publishes the partition view to the plugin (`src/view.rs`), and each active partition is one device named by size, `nvidia.com/nvlink-4gpu`, identified by its partition id; a single-GPU partition is a plain `nvidia.com/gpu`. A partition that is not supported, exclusive and complete is advertised Unhealthy under the same name, in capacity and not allocatable; one with no member bound here is not advertised. Physical IDs resolve through the firmware slot label on the PCI function. A bound fabric without a view advertises no GPU; a view with unit `gpu` advertises one device per GPU. See ARCHITECTURE.md, "Fabric partitions".
 
 With `--resource-naming=sku` the advertised names carry the hardware identity instead, the way the kubevirt GPU device plugin names passthrough devices: the PCI device id is resolved against the `pci-ids` database and sanitized, e.g. `nvidia.com/GH100_H100_SXM5_80GB` for 10de:2330.  Unknown ids fall back to the matching table row's name.  Curated alias rows (exact device id, placed above their class fallback) work in both modes.
 
