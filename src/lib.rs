@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 pub mod cdi;
+pub mod partition;
 pub mod plugin;
 pub mod vfio;
+pub mod view;
 
 pub mod dp {
     pub mod v1beta1 {

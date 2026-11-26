@@ -45,6 +45,12 @@ jobs:
           expected=$(jq -r '.image.repository + ":" + .image.defaultTag' "$chart/index.json")
           actual=$(helm template contract-check "$chart" | yq -r 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image')
           test "$actual" = "$expected"
+          fabric=$(jq -r '[.resourceNaming.aliasResources[] | select(.unit == "fabric") | .name] | unique | .[]' "$chart/index.json")
+          test "$(printf '%s\n' "$fabric" | wc -l)" = 1
+          grep -q "'$fabric' in" "$chart/templates/fabric-owner-policy.yaml"
+          owner=$(helm template owner-check "$chart" | yq -r 'select(.kind == "ValidatingAdmissionPolicyBinding") | .spec.matchResources.namespaceSelector.matchExpressions[0].values[0]')
+          test "$owner" = kata-system
+          test -z "$(helm template owner-check "$chart" --set fabricOwnerNamespaces=null | yq -r 'select(.kind == "ValidatingAdmissionPolicy") | .kind')"
           name() {
             helm template "$1" "$chart" "${@:2}" | yq -r 'select(.kind == "DaemonSet") | .metadata.name'
           }
@@ -76,6 +82,7 @@ jobs:
               - '**/*.lock'
               - 'Cargo.lock'
               - 'proto/**'
+              - 'crates/**'
               - '.github/workflows/static-checks.yaml'
               - '.github/actions/**'
 
@@ -96,7 +103,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: $/.github/actions/rust-toolchain
 
-      - run: cargo test --locked --all-features -- --include-ignored
+      - run: cargo test --locked --workspace --all-features -- --include-ignored
 
   # Check code formatting against Rust style guidelines
   formatting:
@@ -135,7 +142,7 @@ jobs:
         with:
           components: clippy
 
-      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
   # Check dependencies for known security vulnerabilities
   security:
@@ -169,7 +176,9 @@ jobs:
         uses: $/.github/actions/rust-toolchain
 
       - run: cargo install cargo-deny --locked
-      - run: cargo deny check
+      # Every workspace member is a root: the plugin alone would leave the
+      # other members' dependencies unaudited.
+      - run: cargo deny --workspace check
 
   # Detect unused dependencies in Cargo.toml
   unused-deps:
@@ -193,7 +202,7 @@ jobs:
       # +nightly: a bare cargo install would pull the pinned toolchain
       - run: cargo +nightly install cargo-udeps --locked
       # +nightly outranks rust-toolchain.toml; udeps needs nightly-only -Z flags
-      - run: cargo +nightly udeps --locked --all-features --all-targets
+      - run: cargo +nightly udeps --locked --workspace --all-features --all-targets
 
   # Analyze binary size and identify largest functions
   bloat:
@@ -215,5 +224,6 @@ jobs:
       - run: cargo install cargo-bloat --locked
       - run: cargo bloat --locked --release --all-features -n 20
 
-  # No miri job (unlike NVRC): this crate forbids unsafe_code at compile
-  # time, and miri cannot interpret tempfile/tokio in the test harness.
+  # No miri job (unlike NVRC): the plugin forbids unsafe_code at compile
+  # time, fmclient's unsafe is its calls into libnvfm, which CI does not
+  # have, and miri cannot interpret tempfile/tokio in the test harness.
