@@ -4,7 +4,7 @@ Rust. No Go. No exceptions.
 
 ## What this is
 
-A Kubernetes device plugin DaemonSet that enumerates the node's VFIO-bound passthrough devices and declares them to the kubelet. Read-only toward the infrastructure — it only declares what exists, never binds or reconfigures anything (ADR 1000, boundary doc). It talks only to the kubelet over unix sockets; it has no Kubernetes API access.
+A Kubernetes device plugin DaemonSet that enumerates the node's VFIO-bound passthrough devices and declares them to the kubelet. Read-only toward the infrastructure — it only declares what exists, never binds or reconfigures anything (ADR 1000, boundary doc). It talks to the kubelet over unix sockets and hosts the fabric view service, fed only by the node's Service VM; it has no Kubernetes API access.
 
 ## Project layout
 
@@ -13,6 +13,7 @@ src/
   main.rs      entry point: start one DeviceServer per present resource, wait for shutdown
   plugin.rs    DeviceServer (tonic gRPC impl) + socket/CDI-dir constants
   vfio.rs      IOMMUFD cdev enumeration + the RESOURCES table (PCI identity → resource name)
+  view.rs      the fabric view service the Service VM's Fabric Manager client publishes to, and its token
   cdi.rs       host-side CDI spec writer (read by the Kata shim)
 proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
@@ -26,7 +27,7 @@ deploy/
 ## Principles
 
 - **KISS** — fewer files, fewer abstractions. No trait objects, no dynamic dispatch, no registry pattern, no config file. Exactly one CLI flag, `--resource-naming=alias|sku`, because an argument templates directly in the DaemonSet spec; everything else the plugin needs is a kernel, kubelet, or CDI contract expressed as a constant. The device set is dynamic: ListAndWatch polls, and servers for newly appearing resource names are spawned at runtime — no pod restart on device-set changes.
-- **No privileged pods** — the DaemonSet mounts `/dev/vfio` read-only and `/var/lib/kubelet/device-plugins` for the kubelet socket. Nothing else. Isolation is the VM boundary (ADR 10000).
+- **No privileged pods** — the DaemonSet mounts `/dev/vfio` read-only, `/var/lib/kubelet/device-plugins` for the kubelet socket, `/var/run/cdi` for the CDI specs and `/var/run/kata-device-plugin` for the fabric view's token and last view, and exposes one hostPort, 9877, for the view service. Nothing else. Isolation is the VM boundary (ADR 10000).
 - **No reconfiguration, no platform knowledge** — VFIO binding happens on the trusted side. The plugin's whole interface is `/dev/vfio/devices/vfio*`: whatever is bound gets consumed. Each cdev is matched against the `RESOURCES` table in `src/vfio.rs` — one row per PCI identity of a resource: (name, PCI vendor, optional PCI device, PCI class prefix, unit), read from `/sys/class/vfio-dev/vfioN/device`. Fabric rows admit only the cdevs pcilibs-rs's topology scan names. A resource is advertised iff matching devices are present; unmatched devices are ignored. Supporting a new device type is one table row — no other code changes. IOMMUFD only — no legacy VFIO group backend. All paths are kernel contracts, not configuration.
 - **Supply, not demand** — the plugin declares what exists; how it is consumed is the scheduling layer's decision. Whole node vs subset (`nvidia.com/gpu: 4` vs `nvidia.com/gpu: 2`), exclusive tenancy, tray semantics: all of that is expressed in pod specs, node labels, and taints, never encoded here. No aggregate resources, no consumption modes (see ARCHITECTURE.md).
 

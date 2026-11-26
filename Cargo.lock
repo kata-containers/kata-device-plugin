@@ -898,6 +898,7 @@ dependencies = [
  "container-device-interface",
  "futures",
  "hyper-util",
+ "kata-fabric-api",
  "pcilibs-rs",
  "prost",
  "serde-saphyr",

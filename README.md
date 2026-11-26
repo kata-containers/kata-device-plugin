@@ -84,7 +84,9 @@ make image   # container image (bakes the git commit into the startup log)
 The test suite mocks VFIO with temp directories (fake cdevs + sysfs
 identities) and runs a mock kubelet on unix sockets that probes the plugin
 endpoint exactly like the real device manager — so registration ordering,
-stream lifecycle, and CDI output are all covered without hardware.
+stream lifecycle, and CDI output are all covered without hardware. The
+fabric view service has its own tests in `src/view.rs`, publishing over a
+loopback TCP listener with and without the token.
 
 ## Deploying
 
@@ -161,8 +163,12 @@ The Static checks workflow runs this command on every pull request and fails
 if the committed files differ. The Release workflow checks them again before
 publishing.
 
-The DaemonSet mounts three host paths: the kubelet device-plugin socket
-directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
+The DaemonSet mounts four host paths: the kubelet device-plugin socket
+directory, `/dev/vfio` (read-only), `/var/run/cdi`, and
+`/var/run/kata-device-plugin` for the fabric view token and the last view. It
+exposes one hostPort, 9877, the fabric view service the Service VM's Fabric
+Manager client publishes to, token-gated (see ARCHITECTURE.md, "Fabric
+partitions"). It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
 root filesystem — root is required because the kubelet owns its socket
 directory and because PCI VPD, which identifies the NVSwitch management PFs,

@@ -51,11 +51,21 @@ spec:
               value: {{ . | quote }}
           {{- end }}
 
+          ports:
+            # The fabric view service: the Service VM's Fabric Manager client
+            # publishes to the node address on this port, token-gated.  A
+            # hostPort keeps it node-local without a Service.
+            - name: fabric-view
+              containerPort: 9877
+              hostPort: 9877
+              protocol: TCP
+
           # No privileged flag, no added capabilities — ADR 10000.
           securityContext:
             allowPrivilegeEscalation: false
-            # All writes go to hostPath mounts (CDI specs, kubelet socket),
-            # which readOnlyRootFilesystem does not affect.
+            # All writes go to hostPath mounts (CDI specs, kubelet socket,
+            # the plugin's state), which readOnlyRootFilesystem does not
+            # affect.
             readOnlyRootFilesystem: true
             runAsUser: 0                    # kubelet socket ownership requires uid 0
             runAsNonRoot: false
@@ -72,6 +82,10 @@ spec:
               readOnly: true
             - name: cdi
               mountPath: /var/run/cdi
+            # The fabric view token and the last view; a pod restart keeps the
+            # token the Service VM holds and the view the node advertises.
+            - name: state
+              mountPath: /var/run/kata-device-plugin
 
           {{- with .Values.resources }}
           resources:
@@ -90,4 +104,8 @@ spec:
         - name: cdi
           hostPath:
             path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: /var/run/kata-device-plugin
             type: DirectoryOrCreate

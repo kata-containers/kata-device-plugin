@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use kata_device_plugin::{plugin, vfio};
+use kata_device_plugin::{plugin, vfio, view};
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -82,6 +82,31 @@ async fn main() -> anyhow::Result<()> {
 
     let running: Arc<Mutex<HashSet<String>>> = Arc::default();
     let mut tasks = Vec::new();
+
+    // The fabric view service.  A GPU-only node has no use for it, so
+    // neither its state directory nor its listener is fatal: the device
+    // servers below run either way.
+    let view = match view::View::load(Path::new(view::STATE_DIR)) {
+        Ok(view) => Some(view),
+        Err(e) => {
+            tracing::warn!("fabric view service disabled: {e:#}");
+            None
+        }
+    };
+    if let Some(view) = &view {
+        match view::bind().await {
+            Ok(tcp) => {
+                let view = view.clone();
+                let token = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) = view::serve(view, tcp, token).await {
+                        tracing::warn!("fabric view service: {e:#}");
+                    }
+                }));
+            }
+            Err(e) => tracing::warn!("fabric view service not started: {e:#}"),
+        }
+    }
 
     // Reconcile loop: spawn a server for every name that should exist but
     // has none running.  Alias row names are always desired so the kubelet

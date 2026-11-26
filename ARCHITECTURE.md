@@ -6,7 +6,7 @@ This is a **read-only** Kubernetes device plugin. It enumerates VFIO-bound passt
 
 A clash with another plugin advertising `nvidia.com/gpu` is intentional and detects misconfiguration: trusted and untrusted workloads do not share a cluster, so on a Kata/untrusted cluster nothing else exposes this resource.
 
-The plugin talks only to the kubelet, over unix sockets. It has no Kubernetes API access, no RBAC, and no modes — behaviour is identical on every platform.
+The plugin talks to the kubelet over unix sockets and hosts one more endpoint, the fabric view service described below, which only the node's Service VM can feed. It has no Kubernetes API access and no RBAC. Behaviour is identical on every platform; what differs per node is what the fabric owner publishes.
 
 ## Supported platforms
 
@@ -17,6 +17,12 @@ GPUs (and NVSwitches, where the platform has them) are passed through to Kata VM
 ## Service VM
 
 NVSwitch fabrics are never passed to tenant VMs. They go to one Service VM per node that runs Fabric Manager in Shared NVSwitch mode, and that Service VM is itself a Kata pod: it requests `nvidia.com/nvswitch-fabric: 1`, the same on every platform. On HGX H100/H200 that one device holds the four NVSwitch chips. On HGX B200/B300 it holds the management ConnectX whose PFs NVIDIA's integration guide passes to the Service VM together; telling those PFs from the node's data-path ConnectX NICs takes the VPD role marker the guide documents, which pcilibs-rs reads, and the plugin stays a sysfs reader and binds nothing. The fabric is advertised only once every switch function on the node is bound, so a Service VM never starts with part of one. Inside the VM, NVRC selects the H100-style or ConnectX-style fabric services from the same pcilibs-rs discovery, so one Service VM image and one pod spec serve both platforms. GPU partition activation then flows through Fabric Manager's API as in the guide.
+
+## Fabric partitions
+
+In shared NVSwitch mode Fabric Manager in the Service VM activates GPU partitions, and a tenant VM must receive exactly one active partition's GPUs: GPUs that share an active partition reach each other over NVLink, so this is isolation, not convenience. The plugin has to advertise the partitions, and it cannot read Fabric Manager, by design.
+
+**The view.** The Fabric Manager client in the Service VM publishes the partition lists to the plugin's view service in one gRPC call, and the plugin keeps that view, on disk next to its token so a plugin restart keeps the node's capacity, until the next call or until the fabric changes hands. Only the fabric holder may publish: the listener admits only the token the plugin issued, and a new holder withdraws the view, since the partitions it described were the previous holder's. The plugin is a scheduling ledger and Fabric Manager is the enforcement point: a stale view sends a pod to GPUs whose fabric is not ready, where CUDA init fails, and cannot hand out another partition's GPUs. So the command that changes partitions publishes the result and exits; nothing stays connected. The schema is the `kata-fabric-api` crate in this repository.
 
 ## Out of scope: multi-node NVLink (IMEX)
 
