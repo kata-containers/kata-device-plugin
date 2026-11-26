@@ -14,10 +14,27 @@ PCI vendor and class prefix that identify it in `/sys/class/vfio-dev`.
 | Resource | PCI identity |
 | --- | --- |
 | `nvidia.com/gpu` | `0x10de`, class `0x0302xx` (3D controller) |
-| `nvidia.com/nvswitch` | `0x10de`, class `0x0680xx` (bridge: other) |
+| `nvidia.com/nvswitch-fabric` | `0x10de`, class `0x0680xx` (bridge: other), the NVSwitch chips |
+| `nvidia.com/nvswitch-fabric` | `0x15b3`, class `0x0207xx` (InfiniBand controller), NVSwitch management PFs only |
+
+On HGX H100/H200 the NVSwitches are PCI bridge functions. On HGX B200/B300
+they are represented by the PFs of a management ConnectX ([HGX Shared
+NVSwitch guide][hgx-guide], section 3.2.2), which share vendor and class
+with the node's data-path ConnectX NICs. Which functions make up the fabric
+is decided by pcilibs-rs's topology scan, the management PFs by the VPD role
+the guide documents; the rows only say which cdevs may join. The fabric is
+one device on every platform, holding every switch function with one CDI
+device node each, advertised only once all of them are VFIO-bound. A
+Service VM running Fabric Manager requests `nvidia.com/nvswitch-fabric: 1`
+and cannot be given part of a fabric. The reasoning is in
+[ARCHITECTURE.md](ARCHITECTURE.md#service-vm).
 
 The chart's generated [`index.json`](deploy/helm/kata-device-plugin/index.json)
-lists those rows for tools that need the resource names and PCI matches.
+lists those rows for tools that need the resource names and PCI matches: one
+entry per PCI identity with its `unit`, so `nvidia.com/nvswitch-fabric`
+appears twice.
+
+[hgx-guide]: https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf
 
 A resource is advertised iff matching devices are VFIO-bound — declared by
 the node, not configured. Supporting a new device type is one table row; no
@@ -30,7 +47,8 @@ aggregates or partitions what the node declares.
 
 For each present resource the plugin:
 
-1. writes a host CDI spec mapping device indices to IOMMUFD cdev paths —
+1. writes a host CDI spec mapping device indices to the IOMMUFD cdev paths
+   of each device, one node per bound function —
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,
@@ -139,8 +157,9 @@ publishing.
 The DaemonSet mounts three host paths: the kubelet device-plugin socket
 directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
-root filesystem — root is required only because the kubelet owns its
-socket directory.
+root filesystem — root is required because the kubelet owns its socket
+directory and because PCI VPD, which identifies the NVSwitch management PFs,
+is a root-only sysfs attribute.
 
 ## Releasing
 
