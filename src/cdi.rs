@@ -14,18 +14,18 @@ pub fn spec_path(cdi_dir: &Path, resource_name: &str) -> PathBuf {
     cdi_dir.join(format!("kata.{}.yaml", resource_name.replace('/', "-")))
 }
 
-/// Write the host CDI spec mapping index `i` → `devices[i]` — the same IDs
+/// Write the host CDI spec with one CDI device per entry, named by the ID
 /// the plugin advertises.  Kata's shim reads this registry at SandboxCreate
-/// to resolve `nvidia.com/gpu=0` → `/dev/vfio/devices/vfio<N>` for VFIO
-/// passthrough into the hypervisor.  Every bound function of a device is a
-/// device node, so a multi-function PCI device is injected whole.  The CDI
-/// `kind` is the extended-resource name itself.
+/// to resolve `nvidia.com/gpu=0000:1a:00` → `/dev/vfio/devices/vfio<N>` for
+/// VFIO passthrough into the hypervisor.  Every bound function of a device
+/// is a device node, so a multi-function PCI device is injected whole.  The
+/// CDI `kind` is the extended-resource name itself.
 pub fn write_cdi_spec(
     resource_name: &str,
-    devices: &[vfio::Device],
+    entries: &[vfio::Entry],
     cdi_dir: &Path,
 ) -> anyhow::Result<()> {
-    if devices.is_empty() {
+    if entries.is_empty() {
         info!(
             resource = resource_name,
             "no devices, skipping CDI spec write"
@@ -36,14 +36,15 @@ pub fn write_cdi_spec(
     let spec = Spec {
         version: "0.6.0".to_owned(),
         kind: resource_name.to_owned(),
-        devices: devices
+        devices: entries
             .iter()
-            .enumerate()
-            .map(|(idx, dev)| Device {
-                name: idx.to_string(),
+            .map(|entry| Device {
+                name: entry.id.clone(),
                 container_edits: ContainerEdits {
                     device_nodes: Some(
-                        dev.iter()
+                        entry
+                            .device
+                            .iter()
                             .map(|function| DeviceNode {
                                 path: function.path.to_string_lossy().into_owned(),
                                 r#type: Some("c".to_owned()),
@@ -82,7 +83,7 @@ pub fn write_cdi_spec(
 
     info!(
         path = %out_path.display(),
-        devices = devices.len(),
+        devices = entries.len(),
         "wrote CDI spec"
     );
     Ok(())
@@ -94,7 +95,7 @@ mod tests {
     use crate::vfio::{self, testfs, Naming, Sysfs};
     use tempfile::TempDir;
 
-    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<vfio::Device> {
+    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<vfio::Entry> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
@@ -121,7 +122,7 @@ mod tests {
         assert_eq!(spec.kind, "nvidia.com/gpu");
         assert_eq!(spec.devices.len(), 2);
         for (idx, device) in spec.devices.iter().enumerate() {
-            assert_eq!(device.name, idx.to_string());
+            assert_eq!(device.name, format!("0000:{:02x}:00", idx + 8));
             assert_eq!(
                 yaml["devices"][idx]["name"].as_str(),
                 Some(device.name.as_str())
@@ -138,8 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn indices_are_sequential_regardless_of_vfio_numbers() {
-        // vfio numbers can be sparse; CDI indices must be 0, 1, 2, ...
+    fn names_are_slots_in_slot_order_whatever_the_vfio_numbers() {
+        // vfio numbers can be sparse and out of order; the names are the
+        // slots, sorted.
         let root = TempDir::new().unwrap();
         let cdi_dir = TempDir::new().unwrap();
 
@@ -156,7 +158,7 @@ mod tests {
         assert_eq!(spec.devices.len(), 3);
         for (idx, num) in [7, 42, 100].iter().enumerate() {
             let device = &spec.devices[idx];
-            assert_eq!(device.name, idx.to_string());
+            assert_eq!(device.name, format!("0000:{num:02x}:00"));
             let nodes = device.container_edits.device_nodes.as_ref().unwrap();
             assert_eq!(
                 Path::new(&nodes[0].path),
@@ -222,7 +224,7 @@ mod tests {
         let spec: Spec = serde_saphyr::from_str(&contents).unwrap();
         validate_spec(&spec).unwrap();
         assert_eq!(spec.devices.len(), 1);
-        assert_eq!(spec.devices[0].name, "0");
+        assert_eq!(spec.devices[0].name, "0000:05:00");
         let nodes = spec.devices[0]
             .container_edits
             .device_nodes

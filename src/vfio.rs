@@ -13,6 +13,29 @@ pub use pcilibs_rs::{IommufdDev, Sysfs, IOMMUFD_VFIO_DIR as VFIO_DIR, SYSFS as S
 /// siblings.
 pub type Device = Vec<IommufdDev>;
 
+/// One advertised device: the ID the kubelet, the CDI spec and Allocate
+/// share, and the cdevs behind it.  The ID is a fact about the device, the
+/// lowest PCI slot among its functions, so a change elsewhere in the list
+/// never renames a device a pod already holds, the way an index would, and
+/// a rebind that renumbers the cdevs does not move it either.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    pub device: Device,
+}
+
+impl Entry {
+    fn by_slot(device: Device) -> Self {
+        let id = device
+            .iter()
+            .map(|cdev| pcilibs_rs::slot(&cdev.bdf))
+            .min()
+            .expect("a device has at least one function")
+            .to_owned();
+        Self { id, device }
+    }
+}
+
 /// How a row's bound functions become advertised devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
@@ -141,9 +164,8 @@ pub const RESOURCES: &[Resource] = &[
 /// in exactly one resource.  Within a name the row's unit decides the
 /// grouping: PCI-device rows order their devices by PCI address, which
 /// survives a reboot where cdev numbers do not, and a fabric is one device,
-/// advertised whole or not at all.  That order fixes the advertised device
-/// IDs / CDI spec indices.
-pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Device>> {
+/// advertised whole or not at all.  Each device is named by its lowest slot.
+pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<String, Vec<Entry>> {
     // Name, then PCI slot, then the slot's bound functions.  No row has a
     // multi-function PCI device today; the slot is the principle
     // ARCHITECTURE.md states, functions are never separate devices, and the
@@ -209,11 +231,14 @@ pub fn discover(vfio_dir: &Path, sysfs: &Sysfs, naming: Naming) -> BTreeMap<Stri
         missing.is_empty()
     });
     pci.into_iter()
-        .map(|(name, devices)| (name, devices.into_values().collect()))
+        .map(|(name, devices)| {
+            let entries = devices.into_values().map(Entry::by_slot).collect();
+            (name, entries)
+        })
         .chain(
             fabrics
                 .into_iter()
-                .map(|(name, device)| (name, vec![device])),
+                .map(|(name, device)| (name, vec![Entry::by_slot(device)])),
         )
         .collect()
 }
@@ -305,11 +330,15 @@ mod tests {
     use tempfile::TempDir;
 
     /// Cdev numbers per advertised device.
-    fn nums(devices: &[Device]) -> Vec<Vec<u32>> {
-        devices
+    fn nums(entries: &[Entry]) -> Vec<Vec<u32>> {
+        entries
             .iter()
-            .map(|device| device.iter().map(|cdev| cdev.num).collect())
+            .map(|entry| entry.device.iter().map(|cdev| cdev.num).collect())
             .collect()
+    }
+
+    fn ids(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.id.as_str()).collect()
     }
 
     #[test]
@@ -324,7 +353,9 @@ mod tests {
         let map = discover(root.path(), &Sysfs::new(root.path()), Naming::Alias);
         assert_eq!(map.len(), 2);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![7], vec![42]]);
-        assert!(map["nvidia.com/gpu"][0][0].path.ends_with("devices/vfio7"));
+        assert!(map["nvidia.com/gpu"][0].device[0]
+            .path
+            .ends_with("devices/vfio7"));
         assert_eq!(nums(&map["nvidia.com/nvswitch-fabric"]), vec![vec![9]]);
     }
 
@@ -492,6 +523,46 @@ mod tests {
         let map = discover(r, &Sysfs::new(r), Naming::Alias);
         assert_eq!(map.len(), 1);
         assert_eq!(nums(&map["nvidia.com/gpu"]), vec![vec![0]]);
+    }
+
+    #[test]
+    fn ids_are_the_lowest_slot_whatever_the_cdev_order() {
+        // A GPU's ID is its slot, and it stays when another GPU comes or
+        // goes, so a pod's allocation keeps naming what it holds.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        testfs::add_gpu(r, 42);
+        testfs::add_gpu(r, 7);
+        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        assert_eq!(ids(&map["nvidia.com/gpu"]), ["0000:07:00", "0000:2a:00"]);
+        std::fs::remove_file(r.join("devices/vfio7")).unwrap();
+        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        assert_eq!(ids(&map["nvidia.com/gpu"]), ["0000:2a:00"]);
+
+        // H100: switch chips in several slots.  The cdev numbers follow the
+        // bind order, the lowest slot does not.
+        for (low, high) in [(5u32, 9u32), (9, 5)] {
+            let root = TempDir::new().unwrap();
+            let r = root.path();
+            pcilibs_rs::testfs::add_at(r, low, "0000:0c:00.0", 0x10de, 0x22a3, 0x068000);
+            pcilibs_rs::testfs::add_at(r, high, "0000:03:00.0", 0x10de, 0x22a3, 0x068000);
+            let map = discover(r, &Sysfs::new(r), Naming::Alias);
+            assert_eq!(ids(&map["nvidia.com/nvswitch-fabric"]), ["0000:03:00"]);
+        }
+
+        // The management ConnectX: four functions of one slot.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        for function in 0..4u32 {
+            testfs::add_connectx_cdev(
+                r,
+                10 + function,
+                &format!("0000:05:00.{function}"),
+                function < 2,
+            );
+        }
+        let map = discover(r, &Sysfs::new(r), Naming::Alias);
+        assert_eq!(ids(&map["nvidia.com/nvswitch-fabric"]), ["0000:05:00"]);
     }
 
     #[test]

@@ -47,14 +47,21 @@ aggregates or partitions what the node declares.
 
 For each present resource the plugin:
 
-1. writes a host CDI spec mapping device indices to the IOMMUFD cdev paths
-   of each device, one node per bound function —
+1. writes a host CDI spec mapping device IDs to the IOMMUFD cdev paths of
+   each device, one node per bound function —
    `/var/run/cdi/kata.nvidia.com-gpu.yaml` for `nvidia.com/gpu`,
 2. registers with the kubelet over its unix socket and serves the device
    plugin v1beta1 API,
-3. answers `Allocate` with CDI device names (`nvidia.com/gpu=0`) — the
-   container runtime resolves them against the host CDI registry, and the
-   Kata shim wires the cold-plugged VM devices to the right container.
+3. answers `Allocate` with CDI device names (`nvidia.com/gpu=0000:1a:00`,
+   the device's PCI slot) — the container runtime resolves them against the
+   host CDI registry, and the Kata shim wires the cold-plugged VM devices to
+   the right container.
+
+A device's ID is its lowest PCI slot, so it does not change when another
+device comes or goes or when a rebind renumbers the cdevs. Device IDs were
+indices before 0.2.0. The kubelet keeps a running pod's allocation under the
+IDs it was given, which then name no device, so drain the pods holding GPUs
+or the fabric before rolling this plugin onto a node that ran an older one.
 
 No config file, no Kubernetes API access, and a single flag,
 `--resource-naming=alias|sku`, which picks between the table names and
