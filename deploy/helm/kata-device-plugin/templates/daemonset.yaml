@@ -25,6 +25,7 @@ spec:
         app.kubernetes.io/name: kata-device-plugin
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      automountServiceAccountToken: false
       priorityClassName: system-node-critical
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -81,7 +82,7 @@ spec:
       volumes:
         - name: kubelet-socket
           hostPath:
-            path: /var/lib/kubelet/device-plugins
+            path: {{ include "kata-device-plugin.devicePluginPath" . | quote }}
             type: Directory
         - name: vfio
           hostPath:
@@ -89,5 +90,5 @@ spec:
             type: DirectoryOrCreate
         - name: cdi
           hostPath:
-            path: /var/run/cdi
+            path: {{ include "kata-device-plugin.cdiPath" . | quote }}
             type: DirectoryOrCreate

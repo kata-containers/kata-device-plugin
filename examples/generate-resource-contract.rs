@@ -62,6 +62,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
+            "k8sDistribution": {
+                "type": "string",
+                "enum": ["k8s", "k3s", "rke2", "k0s", "microk8s"],
+                "default": string(&values, "k8sDistribution")?,
+            },
+            "hostPaths": {
+                "type": "object",
+                "required": ["devicePlugin", "cdi"],
+                "additionalProperties": false,
+                "properties": {
+                    "devicePlugin": {
+                        "type": "string",
+                        "pattern": "^(|/[^\\r\\n]+)$",
+                        "default": string(&values["hostPaths"], "devicePlugin")?,
+                    },
+                    "cdi": {
+                        "type": "string",
+                        "pattern": "^(|/[^\\r\\n]+)$",
+                        "default": string(&values["hostPaths"], "cdi")?,
+                    },
+                },
+            },
             "resourceNaming": {
                 "type": "string",
                 "enum": modes,

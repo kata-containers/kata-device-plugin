@@ -42,6 +42,9 @@ jobs:
         run: |
           chart=deploy/helm/kata-device-plugin
           helm lint --strict "$chart"
+          for distribution in k8s k3s rke2 k0s microk8s; do
+            helm lint --strict "$chart" --set-string k8sDistribution="$distribution"
+          done
           expected=$(jq -r '.image.repository + ":" + .image.defaultTag' "$chart/index.json")
           actual=$(helm template contract-check "$chart" | yq -r 'select(.kind == "DaemonSet") | .spec.template.spec.containers[0].image')
           test "$actual" = "$expected"
@@ -76,6 +79,7 @@ jobs:
               - '**/*.lock'
               - 'Cargo.lock'
               - 'proto/**'
+              - 'deploy/helm/**'
               - '.github/workflows/static-checks.yaml'
               - '.github/actions/**'
 

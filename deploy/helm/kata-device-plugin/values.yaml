@@ -1,10 +1,19 @@
 # Only what genuinely varies per cluster is configurable.  The security
-# context, hostPath mounts, and priority class are kernel/kubelet/CDI
-# contracts baked into the template — overriding them produces a plugin
-# that does not work (see ARCHITECTURE.md, ADR 10000).
+# context, container mount paths, and priority class are contracts baked
+# into the template (see ARCHITECTURE.md, ADR 10000).
 
 # Set to the previous release name to retain an existing DaemonSet on upgrade.
 fullnameOverride: ""
+
+# Same distribution names as kata-deploy. Only host paths vary; container paths stay fixed.
+k8sDistribution: k8s # k8s, k3s, rke2, k0s, microk8s
+
+# Empty values derive from k8sDistribution; explicit host paths take precedence.
+# devicePlugin must contain the running kubelet's kubelet.sock.
+# cdi must be visible to containerd and the Kata shim in their CDI search paths.
+hostPaths:
+  devicePlugin: ""
+  cdi: ""
 
 image:
   repository: ghcr.io/kata-containers/kata-device-plugin

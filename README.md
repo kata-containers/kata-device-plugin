@@ -52,7 +52,7 @@ Requires `protoc` and the Rust toolchain pinned in
 
 ```sh
 make build   # cargo build --release
-make test    # unit + integration tests: no GPU or cluster required
+make test    # unit + integration tests: no GPU or cluster required (Helm on PATH)
 make image   # container image (bakes the git commit into the startup log)
 ```
 
@@ -102,8 +102,8 @@ gh attestation verify "kata-device-plugin-${VERSION}.tgz" \
 
 The chart is the only deployment model.  It exposes only what varies per
 cluster (image, nodeSelector, tolerations, resources, resource naming,
-log filter); the security context and hostPath mounts are contracts, not
-configuration, and are fixed in the template.
+log filter, distribution, and host socket/CDI overrides). The security context and
+container mount paths are fixed in the template.
 
 The DaemonSet name includes both the release and component name, for example
 `parent-kata-device-plugin` when installed by a high-level parent chart with
@@ -123,7 +123,8 @@ supported naming modes, and default chart image from a pinned chart release.
 `aliasResources` lists the fixed names. In `sku` mode, the names come from the
 PCI ID database at runtime and can fall back to an alias when a device ID is
 unknown. The index therefore does not enumerate SKU names. The generated
-`values.schema.json` checks `resourceNaming` when Helm reads the chart.
+`values.schema.json` checks `resourceNaming`, `k8sDistribution`, and host
+directory overrides when Helm reads the chart.
 
 Both files are generated from the Rust resource table and the chart metadata.
 After changing either source, run:
@@ -141,6 +142,73 @@ directory, `/dev/vfio` (read-only), and `/var/run/cdi`. It runs as uid 0
 (pinned with `runAsUser: 0`) with every capability dropped and a read-only
 root filesystem — root is required only because the kubelet owns its
 socket directory.
+
+### k0s, k3s, MicroK8s, and RKE2
+
+The binary uses the same paths on every distribution. Helm maps the host's
+device-plugin directory to `/var/lib/kubelet/device-plugins` inside the pod,
+and the host's CDI registry to `/var/run/cdi`. Set `k8sDistribution` using the
+same names as kata-deploy; it defaults to `k8s` for upstream Kubernetes.
+
+| Distribution | Host device-plugin directory | `k8sDistribution` |
+| --- | --- | --- |
+| Kubernetes | `/var/lib/kubelet/device-plugins` | `k8s` (default) |
+| k0s | `/var/lib/kubelet/device-plugins` | `k0s` |
+| k3s | `/var/lib/kubelet/device-plugins` | `k3s` |
+| RKE2 | `/var/lib/kubelet/device-plugins` | `rke2` |
+| MicroK8s (classic snap) | `/var/snap/microk8s/common/var/lib/kubelet/device-plugins` | `microk8s` |
+
+These are device-manager paths, not CSI or pod-resources paths. Upstream
+[device-plugin sockets](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)
+are independent of kubelet's `--root-dir`; in particular, k0s's data directory
+does not imply a `/var/lib/k0s/kubelet/device-plugins` socket. MicroK8s
+[attempts to symlink `/var/lib/kubelet`](https://github.com/canonical/microk8s/blob/master/snap/hooks/install),
+but selecting `microk8s` uses its real directory so it also works when that symlink
+could not be created.
+
+For MicroK8s, install the local chart with:
+
+```sh
+helm upgrade --install kata-device-plugin deploy/helm/kata-device-plugin \
+  -n kube-system \
+  --set k8sDistribution=microk8s
+```
+
+With `k8sDistribution=microk8s`, the plugin publishes CDI specs in
+`/var/snap/microk8s/common/run/cdi`. Configure the runtime to search that
+directory: the snap runtime's `/run` can differ from the host's `/run`.
+In `/var/snap/microk8s/current/args/containerd-template.toml`, set
+`enable_cdi = true` and include this directory in `cdi_spec_dirs` under
+`[plugins."io.containerd.grpc.v1.cri"]` for containerd 1.x / config version 2,
+or `[plugins."io.containerd.cri.v1.runtime"]` for containerd 2.x / config
+version 3. Preserve any existing CDI search directories. Apply runtime
+configuration through the distribution's normal restart procedure, and
+ensure the Kata shim can resolve the same specs.
+
+For a custom installation, set `hostPaths.devicePlugin` to the directory
+that actually contains `kubelet.sock`, and `hostPaths.cdi` to a registry
+visible to the runtime. Both default to empty strings, which select the
+distribution's defaults. Explicit paths override the selected distribution
+independently. Selecting a distribution changes the plugin's mounts; the
+runtime's CDI search paths still need to include the selected CDI directory.
+The socket mount uses `Directory` so a wrong path
+fails at pod startup instead of creating an empty registry directory.
+
+All four distributions need the same prerequisites:
+
+- Linux with IOMMUFD VFIO cdev support, devices already bound by the trusted
+  side, and their PCI identities visible under `/sys/class/vfio-dev`.
+- Kata installed and selected by workload `runtimeClassName`, and nodes
+  carrying `katacontainers.io/kata-runtime=true` (or an adjusted `nodeSelector`).
+- Kubernetes with `DevicePluginCDIDevices` enabled (stable since 1.31), and
+  containerd with CDI enabled and the spec directory in its search paths.
+
+After installation, check the DaemonSet rollout, look for `registered with
+kubelet` for both resources in the plugin logs, and inspect node capacity
+for `nvidia.com/gpu` and `nvidia.com/nvswitch`. A node without matching VFIO
+devices should register with zero capacity. A complete hardware check must
+also launch a Kata workload requesting a device and verify it inside the VM;
+successful registration alone does not validate passthrough.
 
 ## Releasing
 
