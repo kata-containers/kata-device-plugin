@@ -3,6 +3,12 @@ name = "kata-device-plugin"
 version = "0.2.0-rc.2"
 edition = "2021"
 
+[workspace]
+# The plugin and the schema of its fabric view service, built from one lock
+# file so the service and the client that publishes to it are always of one
+# commit.
+members = ["crates/fabric-api"]
+
 [lib]
 name = "kata_device_plugin"
 path = "src/lib.rs"

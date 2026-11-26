@@ -16,6 +16,8 @@ src/
   cdi.rs       host-side CDI spec writer (read by the Kata shim)
 proto/
   deviceplugin.proto  kubelet device plugin v1beta1 API
+crates/
+  fabric-api/  the fabric view's schema: proto, generated types with serde, the Publish call's two ends, the token
 build.rs       prost/tonic codegen from proto
 deploy/
   helm/kata-device-plugin/   the only deployment model
@@ -46,8 +48,8 @@ Requires `protoc` (`apt install protobuf-compiler`).
 
 ```sh
 cargo build --release
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo fmt --all --check
 make image   # docker build
 ```
 

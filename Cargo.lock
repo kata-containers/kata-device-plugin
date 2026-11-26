@@ -915,6 +915,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kata-fabric-api"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "serde",
+ "serde_json",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

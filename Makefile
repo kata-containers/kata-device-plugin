@@ -9,14 +9,14 @@ build:
 	cargo build --release
 
 clippy:
-	cargo clippy -- -D warnings
+	cargo clippy --workspace -- -D warnings
 
 fmt:
-	cargo fmt --check
+	cargo fmt --all --check
 
 # Unit tests only (no sockets, no gRPC) — fast, no setup needed.
 test-unit:
-	cargo test --lib
+	cargo test --workspace --lib
 
 # Integration tests: mock kubelet socket + fake VFIO devices.
 # No GPU or Kubernetes cluster required.
